@@ -224,8 +224,11 @@ def build_command(pipeline: str, artifact: str) -> list[str]:
         return [python, "-m", "evolution.prompts.evolve_prompt_section",
                 "--section", artifact, "--iterations", "5", "--apply"]
     elif pipeline == "code":
+        # No --apply: the code pipeline still uses the legacy sign-only gate and would write into
+        # ~/.hermes/hermes-agent (which holds the user's uncommitted work). Report-only until it is
+        # migrated to pairwise/stats gating + staging.
         return [python, "-m", "evolution.code.evolve_tool_code",
-                "--tool", artifact, "--iterations", "10", "--apply"]
+                "--tool", artifact, "--iterations", "10"]
     raise ValueError(f"Unknown pipeline: {pipeline}")
 
 

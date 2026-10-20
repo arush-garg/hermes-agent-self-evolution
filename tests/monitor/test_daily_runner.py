@@ -182,3 +182,10 @@ class TestDryRunReadOnly:
         assert "Would run" in out and "demo-skill" in out
         assert "Housekeeping (bytes)" not in out
         assert len(out) < 4000
+
+
+def test_code_pipeline_never_applies_to_hermes_core():
+    from evolution.monitor.daily_runner import build_command
+    assert "--apply" not in build_command("code", "terminal_tool")
+    # skills keeps --apply: evolve_skill only writes live on a significant, noise-checked promote
+    assert "--apply" in build_command("skills", "x")
