@@ -7,6 +7,12 @@ If the evolved artifact fails to improve (or regresses), the gate:
 2. Refuses to deploy — the apply flag is ignored.
 3. When the artifact type supports it, restores the known-good baseline file
    so a partial or concurrent write cant leave a half-applied state.
+
+DEPRECATED (harness2-upgrade): the sign-only ``improvement > 0`` check is no
+longer used by the skill/prompt/tool pipelines; they use
+:func:`evolution.core.stats_gate.decide` (paired bootstrap CI + min effect) and
+:mod:`evolution.core.staging` (stage by default, backup + rollback). Kept for
+backward compatibility (code pipeline and existing tests).
 """
 
 from __future__ import annotations

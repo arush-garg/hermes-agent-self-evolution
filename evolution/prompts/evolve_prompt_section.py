@@ -21,7 +21,6 @@ from evolution.core.config import EvolutionConfig
 from evolution.core.llm_api import configure_default_lm, get_lm_for_role
 from evolution.core.dataset_builder import SyntheticDatasetBuilder, EvalDataset
 from evolution.core.constraints import ConstraintValidator
-from evolution.core.regression_gate import check_regression
 from evolution.prompts.prompt_module import (
     EVOLVABLE_SECTIONS,
     PromptSectionModule,
@@ -43,6 +42,10 @@ def evolve(
     dry_run: bool = False,
     apply: bool = False,
     create_pr: bool = False,
+    promote: bool = False,
+    min_effect: float = 0.05,
+    repeats: int = 2,
+    max_calls: int = 200,
 ) -> None:
     """Evolve a single system prompt section."""
 
@@ -160,79 +163,72 @@ def evolve(
         console.print(f"  Saved failed variant to {output_path}")
         return
 
-    # ── 7. Evaluate on holdout ───────────────────────────────────────────
-    holdout = dataset.to_dspy_examples("holdout")
-    baseline_scores = []
-    evolved_scores = []
+    # ── 7. Pairwise holdout evaluation (keyword metric only steered GEPA) ──
+    from evolution.core import staging, stats_gate
+    from evolution.core.compose import generate_outputs
+    from evolution.core.pairwise import CallBudget, LLMClient, PairwiseJudge, summarize
+    from evolution.prompts.prompt_module import _extract_constant, _replace_constant
 
-    with dspy.context(lm=lm):
-        for ex in holdout:
-            b_pred = baseline_module(task_input=ex.task_input)
-            baseline_scores.append(prompt_fitness_metric(ex, b_pred))
-            e_pred = optimized_module(task_input=ex.task_input)
-            evolved_scores.append(prompt_fitness_metric(ex, e_pred))
+    budget = CallBudget(max_calls=max_calls)
+    agent = LLMClient(budget, "eval", temperature=0.0, max_tokens=2048)
+    judge = PairwiseJudge(LLMClient(budget, "judge", temperature=0.0, max_tokens=2048,
+                                    fallback_role="eval"), repeats=repeats, seed=0)
+    holdout = [ex.to_dict() for ex in dataset.holdout]
+    try:
+        base_out = generate_outputs(agent, section_text, holdout, kind="system prompt section")
+        evo_out = generate_outputs(agent, evolved_text, holdout, kind="system prompt section")
+        pairs = judge.evaluate(holdout, base_out, evo_out)
+    except Exception as e:  # BudgetExceeded or provider failure
+        console.print(f"[yellow]pairwise eval incomplete: {e}[/yellow]")
+        pairs = []
+    gate = stats_gate.decide(pairs, min_effect=min_effect, min_pairs=8)
+    st = summarize(pairs)
+    improvement = gate.improvement
 
-    avg_baseline = sum(baseline_scores) / max(1, len(baseline_scores))
-    avg_evolved = sum(evolved_scores) / max(1, len(evolved_scores))
-    improvement = avg_evolved - avg_baseline
-
-    # ── 8a. Regression gate ────────────────────────────────────────────
-    passed_gate = check_regression(
-        improvement=improvement,
-        baseline_score=avg_baseline,
-        evolved_score=avg_evolved,
-        artifact_type="prompt_section",
-        artifact_name=section,
-    )
-
-    # ── 8. Report results ────────────────────────────────────────────────
     table = Table(title=f"Prompt Section Evolution — {section}")
     table.add_column("Metric", style="bold")
-    table.add_column("Baseline", justify="right")
-    table.add_column("Evolved", justify="right")
-    table.add_column("Change", justify="right")
-
-    change_color = "green" if improvement > 0 else "red"
-    table.add_row("Behavioral Score", f"{avg_baseline:.3f}", f"{avg_evolved:.3f}",
-                  f"[{change_color}]{improvement:+.3f}[/{change_color}]")
-    table.add_row("Size", f"{len(section_text):,}", f"{len(evolved_text):,}",
-                  f"{len(evolved_text) - len(section_text):+,} chars")
+    table.add_column("Value", justify="right")
+    table.add_row("Holdout pairs", f"{gate.n_pairs} (W{st.wins}/T{st.ties}/L{st.losses})")
+    table.add_row("Win score (0.5 = parity)", f"{gate.mean:.3f}")
+    table.add_row("95% CI", f"[{gate.ci_low:.3f}, {gate.ci_high:.3f}]  p={gate.p_value:.4f}")
+    table.add_row("Decision", gate.decision)
+    table.add_row("Size", f"{len(section_text):,} -> {len(evolved_text):,}")
+    table.add_row("LLM calls (eval)", f"{budget.used}/{budget.max_calls}")
     console.print()
     console.print(table)
 
-    # ── 9. Save output ───────────────────────────────────────────────────
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    output_dir = Path("output") / "prompts" / section / timestamp
-    output_dir.mkdir(parents=True, exist_ok=True)
+    # ── 8. Stage (default) / promote ────────────────────────────────────
+    live_path = config.hermes_agent_path / "agent" / "prompt_builder.py"
+    staged_path = None
+    if evolved_text.strip() != section_text.strip():
+        source = live_path.read_text()
+        original = _extract_constant(source, section, live_path)
+        new_source = _replace_constant(source, section, original, evolved_text)
+        stats = gate.to_dict() | {"wins": st.wins, "ties": st.ties, "losses": st.losses,
+                                  "order_inconsistent": st.order_inconsistent,
+                                  "elapsed_seconds": elapsed}
+        m = staging.finalize(f"prompt_{section}", "prompt_section", live_path, new_source, stats,
+                             apply=apply, force_promote=promote,
+                             extra_files={"evolved_section.txt": evolved_text,
+                                          "baseline_section.txt": section_text,
+                                          "metrics.json": {"section": section, "baseline_score": 0.5,
+                                                           "evolved_score": gate.mean,
+                                                           "improvement": improvement, **stats}})
+        staged_path = m["staged_path"]
+        console.print(f"  staged → {staged_path}")
+        if m.get("status") == "promoted":
+            console.print(f"  [green]✓ promoted to {live_path} (backup {m.get('backup_path')})[/green]")
+        elif m.get("promotion_error"):
+            console.print(f"  [red]✗ promotion aborted: {m['promotion_error']}[/red]")
 
-    (output_dir / "evolved_section.txt").write_text(evolved_text)
-    (output_dir / "baseline_section.txt").write_text(section_text)
-    metrics = {
-        "section": section,
-        "timestamp": timestamp,
-        "baseline_score": avg_baseline,
-        "evolved_score": avg_evolved,
-        "improvement": improvement,
-        "baseline_size": len(section_text),
-        "evolved_size": len(evolved_text),
-        "elapsed_seconds": elapsed,
-        "constraints_passed": all_pass,
-    }
-    (output_dir / "metrics.json").write_text(json.dumps(metrics, indent=2))
-    console.print(f"\n  Output saved to {output_dir}/")
-
-    if passed_gate:
-        console.print(f"\n[bold green]✓ Section improved by {improvement:+.3f}[/bold green]")
-        if apply:
-            try:
-                save_prompt_section(section, evolved_text, config.hermes_agent_path)
-                console.print(f"  [green]✓ Applied to {config.hermes_agent_path}/agent/prompt_builder.py[/green]")
-            except (ValueError, KeyError) as e:
-                console.print(f"  [red]✗ Could not apply: {e}[/red]")
-        else:
-            console.print(f"  Review diff: diff {output_dir}/baseline_section.txt {output_dir}/evolved_section.txt")
+    if improvement > 0 and gate.decision != "reject":
+        console.print(f"\n[bold green]✓ Section improved by {improvement:+.3f} (decision={gate.decision})[/bold green]")
     else:
         console.print(f"\n[yellow]⚠ No improvement (change: {improvement:+.3f})[/yellow]")
+    print("EVOLUTION_RESULT " + json.dumps(dict(
+        success=True, improvement=improvement, ci_low=gate.ci_low, ci_high=gate.ci_high,
+        p_value=gate.p_value, decision=gate.decision, staged_path=staged_path,
+        n_pairs=gate.n_pairs)), flush=True)
 
 
 @click.command()
@@ -245,11 +241,19 @@ def evolve(
 @click.option("--hermes-repo", default=None, help="Path to hermes-agent repo")
 @click.option("--benchmark-gate", is_flag=True, help="Run TBLite (zero tolerance for regression)")
 @click.option("--dry-run", is_flag=True, help="Validate setup without running optimization")
-@click.option("--apply", is_flag=True, help="Write evolved section back to prompt_builder.py")
+@click.option("--apply", is_flag=True, help="Write to prompt_builder.py ONLY if the stats gate says promote")
 @click.option("--create-pr", is_flag=True, help="Create PR in hermes-agent repo")
+@click.option("--stage-only", is_flag=True, help="Default: stage only, never write live")
+@click.option("--promote", "force_promote", is_flag=True, help="Explicitly promote the staged candidate")
+@click.option("--min-effect", default=0.05, show_default=True)
+@click.option("--repeats", default=2, show_default=True)
+@click.option("--max-calls", default=200, show_default=True, help="Cap on pairwise-eval LLM calls")
 def main(section, iterations, optimizer_model, eval_model, hermes_repo,
-         benchmark_gate, dry_run, apply, create_pr):
+         benchmark_gate, dry_run, apply, create_pr, stage_only, force_promote, min_effect,
+         repeats, max_calls):
     """Evolve a hermes-agent system prompt section using DSPy + GEPA."""
+    if stage_only:
+        apply, force_promote = False, False
     evolve(
         section=section,
         iterations=iterations,
@@ -260,6 +264,10 @@ def main(section, iterations, optimizer_model, eval_model, hermes_repo,
         dry_run=dry_run,
         apply=apply,
         create_pr=create_pr,
+        promote=force_promote,
+        min_effect=min_effect,
+        repeats=repeats,
+        max_calls=max_calls,
     )
 
 

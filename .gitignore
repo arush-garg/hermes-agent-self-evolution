@@ -28,3 +28,6 @@ logs/
 .vscode/
 *.swp
 *.swo
+
+# Staged evolution candidates, manifests, backups (evolution.core.staging)
+staging/

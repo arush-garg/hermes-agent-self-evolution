@@ -30,7 +30,7 @@ from typing import Optional
 import click
 from rich.console import Console
 
-from evolution.core import staging
+from evolution.core import staging, stats_gate
 from evolution.core.compose import (load_failure_context, load_lessons, propose_probe_compose,
                                     record_lesson)
 from evolution.core.config import EvolutionConfig, resolve_hermes_agent_path
@@ -85,15 +85,30 @@ def _load_dataset(skill_name, skill, eval_source, dataset_path, config, eval_mod
 
 
 def _resplit(ds, n_val: int, n_holdout_min: int, seed: int):
-    """Ensure holdout has >= n_holdout_min examples (taken from train first). Val is capped."""
+    """Leakage-safe split adjustment.
+
+    * Real-session rows keep the builder's session/chronological split; they are never
+      moved into holdout here (that could put an older session in holdout and a newer one
+      of the same task in train).
+    * Only session-less (synthetic) rows may be moved from train/val to top up holdout.
+    * Any train/val row sharing a session_id or identical task_input with holdout is
+      dropped (no leakage).
+    """
     train, val, hold = (_examples_as_dicts(ds.train), _examples_as_dicts(ds.val),
                         _examples_as_dicts(ds.holdout))
     rng = random.Random(seed)
-    pool = train + val
-    while len(hold) < n_holdout_min and len(pool) > 2:
-        hold.append(pool.pop(rng.randrange(len(pool))))
-    train = [e for e in train if e in pool]
-    val = [e for e in val if e in pool]
+    movable = [e for e in train + val if not e.get("session_id")]
+    while len(hold) < n_holdout_min and len(movable) > 2:
+        e = movable.pop(rng.randrange(len(movable)))
+        hold.append(e)
+        (train if e in train else val).remove(e)
+    hold_sids = {e.get("session_id") for e in hold if e.get("session_id")}
+    hold_tasks = {str(e.get("task_input", "")).strip() for e in hold}
+
+    def clean(xs):
+        return [e for e in xs if e.get("session_id") not in hold_sids
+                and str(e.get("task_input", "")).strip() not in hold_tasks]
+    train, val = clean(train), clean(val)
     if len(val) < 2 and len(train) > 2:
         val += [train.pop() for _ in range(min(2, len(train) - 1))]
     return train, val[:n_val], hold
@@ -156,7 +171,9 @@ def evolve(
     dataset = _load_dataset(skill_name, skill, eval_source, dataset_path, config, eval_model, min_total)
     budget.spend("dataset")  # synthetic/mixed generation ≈ 1 call (approximate, counted)
     train, val, holdout = _resplit(dataset, val_size, holdout_min, seed)
-    console.print(f"  train={len(train)} val={len(val)} holdout={len(holdout)}")
+    n_real_h = sum(1 for e in holdout if stats_gate.is_real_example(e))
+    console.print(f"  train={len(train)} val={len(val)} holdout={len(holdout)} "
+                  f"(holdout real={n_real_h}, synthetic={len(holdout) - n_real_h})")
     if not holdout or not val:
         console.print("[red]✗ dataset too small[/red]")
         res = dict(success=False, improvement=0.0, ci_low=None, ci_high=None, p_value=None,
@@ -196,7 +213,8 @@ def evolve(
         noise_agent_chat=noise_agent if noise_check else None,
         validate=_validate, log=lambda s: console.print(s),
     )
-    gate = result.gate
+    gate = stats_gate.apply_provenance_guard(result.gate, holdout)
+    n_real = sum(1 for e in holdout if stats_gate.is_real_example(e))
     st = summarize(result.holdout_results)
     elapsed = time.time() - start
 
@@ -225,6 +243,7 @@ def evolve(
                       + ([{"name": result.composite.name, "probe_score": result.composite.probe_score,
                            "error": result.composite.error}] if result.composite else []),
         "notes": result.notes,
+        "holdout_real": n_real, "holdout_synthetic": len(holdout) - n_real,
     }
     if result.winner is not None:
         evolved_full = reassemble_skill(skill["frontmatter"], result.winner.body)
@@ -261,7 +280,7 @@ def evolve(
     res = dict(success=True, improvement=improvement, ci_low=gate.ci_low, ci_high=gate.ci_high,
                p_value=gate.p_value, decision=gate.decision, staged_path=staged_path,
                n_pairs=gate.n_pairs, promoted=promoted, llm_calls=budget.used,
-               noise=result.noise)
+               noise=result.noise, holdout_real=n_real, holdout_synthetic=len(holdout) - n_real)
     _emit(res)
     return res
 

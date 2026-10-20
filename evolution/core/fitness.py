@@ -2,6 +2,11 @@
 
 Uses LLM-as-judge with rubrics to score agent outputs.
 Supports length penalties and multi-dimensional scoring.
+
+NOTE (harness2-upgrade): ``skill_fitness_metric`` (keyword overlap) is a cheap
+inner-loop PROXY only (e.g. for GEPA search in the prompt pipeline). Keep/reject
+decisions are made by grader-free pairwise judging on HOLDOUT
+(:mod:`evolution.core.pairwise`) gated by :mod:`evolution.core.stats_gate`.
 """
 
 import dspy

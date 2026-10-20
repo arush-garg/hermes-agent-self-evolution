@@ -254,6 +254,38 @@ def summarize(results: Sequence[PairResult]) -> PairwiseStats:
     )
 
 
+_CORR_PREFIX = "Correction takes priority:"
+
+
+def rubric_for(ex: dict) -> str:
+    """Build judge reference notes from a dataset row WITHOUT leaking superseded answers.
+
+    * outcome='corrected': replay rows look like ``"Correction takes priority: <user
+      correction>\n<assistant answer the user rejected>"``. Only the correction is kept
+      and the judge is told the original answer was wrong.
+    * outcome='failed': the recorded answer is a failed attempt → dropped entirely.
+    * other real-session rows: the past answer is shown only as an imperfect hint.
+    """
+    exp = str(ex.get("expected_behavior") or "")
+    outcome = str(ex.get("outcome") or "unknown")
+    src = str(ex.get("source") or "")
+    if outcome == "corrected" or exp.startswith(_CORR_PREFIX):
+        corr = exp[len(_CORR_PREFIX):].strip() if exp.startswith(_CORR_PREFIX) else ""
+        # The superseded answer follows the first newline; keep only the first line so it
+        # can never leak (a multi-line correction loses its tail — acceptable trade-off).
+        corr = corr.split("\n", 1)[0].strip() or "(correction text unavailable)"
+        return ("In the original session the user CORRECTED the assistant. The user's correction "
+                "(highest priority; the assistant's original answer was wrong and is intentionally "
+                "omitted — do not reward responses that repeat the mistake):\n" + corr[:700])
+    if outcome == "failed":
+        return ("The original attempt at this task FAILED (tool errors / incomplete). No reference "
+                "answer is provided; judge on correctness and sound procedure.")
+    if src in ("sessiondb", "replay", "hermes", "claude-code", "copilot") or ex.get("session_id"):
+        return ("Answer given in a past real session (may be imperfect; do NOT reward verbatim "
+                "copying — reward correctness):\n" + exp[:1200])
+    return exp
+
+
 class PairwiseJudge:
     """Anonymized, order-randomized pairwise judge."""
 
@@ -319,7 +351,7 @@ class PairwiseJudge:
         for i, (ex, b, c) in enumerate(zip(examples, baseline_outputs, candidate_outputs)):
             eid = str(ex.get("id") or ex.get("session_id") or i)
             try:
-                out.append(self.compare(eid, ex.get("task_input", ""), ex.get("expected_behavior", ""), b, c))
+                out.append(self.compare(eid, ex.get("task_input", ""), rubric_for(ex), b, c))
             except BudgetExceeded:
                 logger.warning("budget exhausted during pairwise eval after %d/%d", i, len(examples))
                 break

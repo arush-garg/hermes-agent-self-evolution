@@ -115,3 +115,25 @@ def noise_check(baseline_vs_baseline: Sequence, n_resamples: int = MIN_RESAMPLES
     return {"n": int(len(s)), "mean": mean, "ci_low": lo, "ci_high": hi,
             "abs_effect": abs(mean - 0.5),
             "would_promote": bool(len(s) >= 8 and lo > 0.5 and mean - 0.5 >= 0.05)}
+
+
+REAL_SOURCES = ("sessiondb", "replay", "hermes", "claude-code", "copilot", "golden")
+
+
+def is_real_example(ex) -> bool:
+    src = (ex.get("source") if isinstance(ex, dict) else getattr(ex, "source", "")) or ""
+    return str(src).lower() in REAL_SOURCES
+
+
+def apply_provenance_guard(gate: GateResult, holdout: Sequence) -> GateResult:
+    """Never auto-promote on a holdout containing synthetic cases (can still stage).
+
+    Synthetic examples are LLM-written from the artifact itself, so a win there is not
+    evidence of real-task improvement.
+    """
+    n_syn = sum(1 for ex in holdout if not is_real_example(ex))
+    if n_syn and gate.decision == "promote":
+        gate.decision = "stage"
+        gate.reasons.append(f"holdout contains {n_syn}/{len(holdout)} synthetic cases — "
+                            "promotion requires an all-real holdout")
+    return gate

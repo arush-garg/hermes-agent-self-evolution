@@ -24,7 +24,7 @@ from dataclasses import dataclass, field
 from typing import Callable, Optional, Sequence
 
 from evolution.core.pairwise import (BudgetExceeded, CallBudget, PairResult, PairwiseJudge,
-                                     summarize)
+                                     rubric_for, summarize)
 from evolution.core import stats_gate
 
 logger = logging.getLogger(__name__)
@@ -184,7 +184,7 @@ def _fmt_examples(examples: Sequence[dict], n: int = 4) -> str:
     lines = []
     for ex in list(examples)[:n]:
         lines.append(f"- TASK: {str(ex.get('task_input', ''))[:400]}\n  GOOD RESPONSE: "
-                     f"{str(ex.get('expected_behavior', ''))[:300]}")
+                     f"{rubric_for(ex)[:300]}")
     return "\n".join(lines) or "(none)"
 
 

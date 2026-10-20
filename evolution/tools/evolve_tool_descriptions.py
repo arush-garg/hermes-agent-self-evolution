@@ -22,7 +22,6 @@ from evolution.core.llm_api import configure_default_lm, get_lm_for_role
 from evolution.core.config import EvolutionConfig
 from evolution.core.dataset_builder import SyntheticDatasetBuilder, EvalDataset, EvalExample
 from evolution.core.constraints import ConstraintValidator
-from evolution.core.regression_gate import check_regression
 from evolution.tools.tool_module import (
     ToolDescription,
     ToolSelectionModule,
@@ -164,6 +163,8 @@ def evolve(
     dry_run: bool = False,
     create_pr: bool = False,
     apply: bool = False,
+    promote: bool = False,
+    min_effect: float = 0.05,
 ) -> None:
     """Evolve all tool descriptions using DSPy + GEPA.
 
@@ -290,14 +291,14 @@ def evolve(
     avg_evolved = sum(evolved_scores) / max(1, len(evolved_scores))
     improvement = avg_evolved - avg_baseline
 
-    # ── 7a. Regression gate ──────────────────────────────────────────────
-    passed_gate = check_regression(
-        improvement=improvement,
-        baseline_score=avg_baseline,
-        evolved_score=avg_evolved,
-        artifact_type="tool_descriptions",
-        artifact_name="all",
-    )
+    # ── 7a. Statistical gate on paired per-example accuracy ─────────────
+    # Tool selection has an exact, grader-free metric, so we gate on the paired
+    # difference: per-example score = 0.5 + (evolved - baseline) / 2 (0.5 = tie).
+    from evolution.core import staging, stats_gate
+    paired = [0.5 + (e - b_) / 2 for b_, e in zip(baseline_scores, evolved_scores)]
+    gate = stats_gate.decide(paired, min_effect=min_effect, min_pairs=8)
+    console.print(f"  stats gate: paired score={gate.mean:.3f} CI=[{gate.ci_low:.3f}, {gate.ci_high:.3f}] "
+                  f"p={gate.p_value:.4f} n={gate.n_pairs} decision={gate.decision}")
 
     # ── 7. Report results ────────────────────────────────────────────────
     table = Table(title="Tool Description Evolution Results")
@@ -316,57 +317,41 @@ def evolve(
     console.print()
     console.print(table)
 
-    # ── 8. Save output ───────────────────────────────────────────────────
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    output_dir = Path("output") / "tool_descriptions" / timestamp
-    output_dir.mkdir(parents=True, exist_ok=True)
+    # ── 8. Stage (default) ───────────────────────────────────────────────
+    stats = gate.to_dict() | {"baseline_score": avg_baseline, "evolved_score": avg_evolved,
+                              "accuracy_improvement": improvement, "tools_evolved": len(tools),
+                              "elapsed_seconds": elapsed, "iterations": iterations}
+    staged_paths = []
+    try:
+        evolved_raw = json.loads(optimized_module.tools_text)
+    except (json.JSONDecodeError, TypeError) as e:
+        console.print(f"[red]Failed to parse evolved tool descriptions: {e}[/red]")
+        evolved_raw = []
+    evolved_tools = [ToolDescription(name=td.get("name", ""), description=td.get("description", ""),
+                                     parameters=td.get("parameters", {})) for td in evolved_raw]
+    changes = apply_evolved_descriptions(tools, evolved_tools, config.hermes_agent_path) if evolved_tools else []
+    # Each changed source file is staged as its own artifact (own backup/rollback).
+    for rel_path, new_content in changes or []:
+        abs_path = config.hermes_agent_path / rel_path
+        art = "tool_" + str(rel_path).replace("/", "_")
+        m = staging.finalize(art, "tool_source", abs_path, new_content, stats,
+                             apply=apply, force_promote=promote,
+                             extra_files={"evolved_tools.json": evolved_raw, "metrics.json": stats})
+        staged_paths.append(m["staged_path"])
+        status = m.get("status")
+        console.print(f"  {rel_path}: {status}" + (f" (abort: {m['promotion_error']})" if m.get("promotion_error") else ""))
+    if not changes:
+        console.print("[yellow]No description changes detected.[/yellow]")
 
-    metrics = {
-        "timestamp": timestamp,
-        "iterations": iterations,
-        "optimizer_model": optimizer_model,
-        "eval_model": eval_model,
-        "baseline_score": avg_baseline,
-        "evolved_score": avg_evolved,
-        "improvement": improvement,
-        "tools_evolved": len(tools),
-        "elapsed_seconds": elapsed,
-    }
-    (output_dir / "metrics.json").write_text(json.dumps(metrics, indent=2))
-
-    console.print(f"\n  Output saved to {output_dir}/")
-
-    if passed_gate:
-        console.print(f"\n[bold green]✓ Tool descriptions improved by {improvement:+.3f}[/bold green]")
+    if improvement > 0 and gate.decision != "reject":
+        console.print(f"\n[bold green]✓ Tool descriptions improved by {improvement:+.3f} (decision={gate.decision})[/bold green]")
     else:
         console.print(f"\n[yellow]⚠ No improvement (change: {improvement:+.3f})[/yellow]")
-        console.print("  Try: more iterations, larger dataset, or different optimizer model")
-
-    # ── 9. Optionally apply evolved descriptions ──────────────────────────────────────
-    if apply and passed_gate:
-        # ``optimized_module.tools_text`` contains the (potentially) evolved JSON string.
-        try:
-            evolved_raw = json.loads(optimized_module.tools_text)
-        except json.JSONDecodeError as e:
-            console.print(f"[red]Failed to parse evolved tool descriptions: {e}[/red]")
-            evolved_raw = []
-
-        evolved_tools: list[ToolDescription] = []
-        for td in evolved_raw:
-            name = td.get("name", "")
-            description = td.get("description", "")
-            parameters = td.get("parameters", {})
-            evolved_tools.append(ToolDescription(name=name, description=description, parameters=parameters))
-
-        changes = apply_evolved_descriptions(tools, evolved_tools, config.hermes_agent_path)
-        if changes:
-            for rel_path, new_content in changes:
-                abs_path = config.hermes_agent_path / rel_path
-                abs_path.parent.mkdir(parents=True, exist_ok=True)
-                abs_path.write_text(new_content)
-            console.print(f"[green]Applied evolved descriptions to {len(changes)} file(s).[/green]")
-        else:
-            console.print("[yellow]No description changes detected to apply.[/yellow]")
+    print("EVOLUTION_RESULT " + json.dumps(dict(
+        success=True, improvement=improvement, ci_low=gate.ci_low, ci_high=gate.ci_high,
+        p_value=gate.p_value, decision=gate.decision,
+        staged_path=staged_paths[0] if staged_paths else None,
+        staged_paths=staged_paths, n_pairs=gate.n_pairs)), flush=True)
 
 
 @click.command()
@@ -381,10 +366,16 @@ def evolve(
 @click.option("--benchmark-gate", is_flag=True, help="Run TBLite as regression gate")
 @click.option("--dry-run", is_flag=True, help="Validate setup without running optimization")
 @click.option("--create-pr", is_flag=True, help="Create PR in hermes-agent repo")
-@click.option("--apply", is_flag=True, help="Apply evolved descriptions back to source files if improved")
+@click.option("--apply", is_flag=True, help="Apply to source ONLY if the stats gate says promote")
+@click.option("--stage-only", is_flag=True, help="Default: stage only, never write live")
+@click.option("--promote", "force_promote", is_flag=True, help="Explicitly promote staged files")
+@click.option("--min-effect", default=0.05, show_default=True)
 def main(iterations, eval_source, dataset_path, optimizer_model, eval_model,
-         hermes_repo, run_tests, benchmark_gate, dry_run, create_pr, apply):
+         hermes_repo, run_tests, benchmark_gate, dry_run, create_pr, apply, stage_only,
+         force_promote, min_effect):
     """Evolve hermes-agent tool descriptions using DSPy + GEPA."""
+    if stage_only:
+        apply, force_promote = False, False
     evolve(
         iterations=iterations,
         eval_source=eval_source,
@@ -397,6 +388,8 @@ def main(iterations, eval_source, dataset_path, optimizer_model, eval_model,
         dry_run=dry_run,
         create_pr=create_pr,
         apply=apply,
+        promote=force_promote,
+        min_effect=min_effect,
     )
 
 
