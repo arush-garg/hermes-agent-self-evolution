@@ -398,5 +398,18 @@ def propose_probe_compose(
         gate.decision = "reject"
         gate.reasons.append("no candidate beat baseline on val")
     gate.noise_check = noise
+    # The baseline-vs-baseline noise check must GATE promotion, not just be reported:
+    # if the judge "finds" an effect between two samples of the same artifact, a candidate
+    # effect of similar size is indistinguishable from judge/sampling noise.
+    if gate.decision == "promote":
+        effect = (gate.mean if getattr(gate, "mean", None) is not None else 0.5) - 0.5
+        if noise is None:
+            gate.decision = "stage"
+            gate.reasons.append("noise check unavailable: cannot rule out judge noise -> stage")
+        elif noise.get("would_promote") or effect < noise.get("abs_effect", 0.0) + min_effect:
+            gate.decision = "stage"
+            gate.reasons.append(
+                f"effect {effect:+.3f} not above noise {noise.get('abs_effect', 0.0):.3f} + "
+                f"min_effect {min_effect:.2f} (baseline-vs-baseline mean {noise.get('mean', 0.5):.3f}) -> stage")
     return ComposeResult(baseline_body, candidates, composite, winner, holdout_results, gate,
                          noise, budget.summary(), notes)

@@ -50,6 +50,8 @@ def make_env(rank, budget=None, merge_ok=True):
 
 def run(rank, k=3, holdout_n=10, **kw):
     budget, opt, agent, judge, props = make_env(rank, kw.pop("budget", None), kw.pop("merge_ok", True))
+    if kw.pop("noise", False):
+        kw["noise_agent_chat"] = agent
     res = compose.propose_probe_compose(
         baseline_body=BASE, train=_examples(4, "tr"), val=_examples(4, "val"),
         holdout=_examples(holdout_n, "ho"), agent_chat=agent, optimizer_chat=opt, judge=judge,
@@ -57,8 +59,12 @@ def run(rank, k=3, holdout_n=10, **kw):
     return res, props, budget
 
 
-def test_composite_wins_and_is_promoted():
-    res, props, _ = run({"GENERAL": 1, "DOMAIN": 1, "COMPOSITE": 2, "CONCISE": -1})
+def test_composite_wins_and_is_promoted(monkeypatch):
+    from evolution.core import stats_gate
+    # clean judge: baseline-vs-baseline shows no effect
+    monkeypatch.setattr(stats_gate, "noise_check", lambda *a, **k: {"n": 8, "mean": 0.5, "ci_low": 0.3,
+                        "ci_high": 0.7, "abs_effect": 0.0, "would_promote": False})
+    res, props, _ = run({"GENERAL": 1, "DOMAIN": 1, "COMPOSITE": 2, "CONCISE": -1}, noise=True)
     assert [c.name for c in res.candidates] == ["general", "domain", "concise"]
     assert res.composite is not None and res.composite.probe_score == 1.0
     assert res.winner is res.composite
@@ -129,3 +135,52 @@ def test_lessons_import_tolerant(monkeypatch, tmp_path):
     row = compose.record_lesson("git", "github-workflow", "set upstream", "mean=0.8")
     assert row is not None
     assert compose.load_lessons(["git"])[0]["lesson"] == "set upstream"
+
+
+def _gate_with(decision_mean, noise):
+    from evolution.core.stats_gate import GateResult
+    g = GateResult(decision="promote", mean=decision_mean, ci_low=0.55, ci_high=0.8, p_value=0.01,
+                   n_pairs=30, min_effect=0.05)
+    return g
+
+
+def test_noisy_judge_blocks_promotion(monkeypatch):
+    """A baseline-vs-baseline 'effect' as large as the candidate's must downgrade promote->stage."""
+    from evolution.core import stats_gate
+    budget, opt, agent, judge, _ = make_env({"GENERAL": 2, "DOMAIN": 1})
+    real_gate = stats_gate.decide
+
+    def fake_gate(*a, **k):
+        g = real_gate(*a, **k)
+        g.decision, g.mean = "promote", 0.667
+        return g
+
+    monkeypatch.setattr(stats_gate, "decide", fake_gate)
+    monkeypatch.setattr(stats_gate, "noise_check",
+                        lambda *a, **k: {"n": 8, "mean": 0.75, "ci_low": 0.56, "ci_high": 0.94,
+                                         "abs_effect": 0.25, "would_promote": True})
+    res = compose.propose_probe_compose(
+        baseline_body=BASE, train=_examples(4, "tr"), val=_examples(4, "val"),
+        holdout=_examples(10, "ho"), agent_chat=agent, optimizer_chat=opt, judge=judge,
+        budget=budget, k=2, noise_agent_chat=agent, log=lambda s: None)
+    if res.winner is not None:
+        assert res.gate.decision == "stage"
+        assert any("noise" in r for r in res.gate.reasons)
+
+
+def test_missing_noise_check_blocks_promotion(monkeypatch):
+    from evolution.core import stats_gate
+    budget, opt, agent, judge, _ = make_env({"GENERAL": 2, "DOMAIN": 1})
+    real_gate = stats_gate.decide
+
+    def fake_gate(*a, **k):
+        g = real_gate(*a, **k)
+        g.decision, g.mean = "promote", 0.9
+        return g
+
+    monkeypatch.setattr(stats_gate, "decide", fake_gate)
+    res = compose.propose_probe_compose(
+        baseline_body=BASE, train=_examples(4, "tr"), val=_examples(4, "val"),
+        holdout=_examples(10, "ho"), agent_chat=agent, optimizer_chat=opt, judge=judge,
+        budget=budget, k=2, noise_agent_chat=None, log=lambda s: None)
+    assert res.gate.decision != "promote"
