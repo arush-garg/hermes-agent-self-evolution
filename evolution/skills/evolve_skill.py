@@ -211,7 +211,7 @@ def evolve(
         kind="skill", lessons=lessons, failure_context=failure_ctx,
         max_growth=0.3, min_effect=min_effect, min_pairs=8, seed=seed,
         noise_agent_chat=noise_agent if noise_check else None,
-        validate=_validate, log=lambda s: console.print(s),
+        validate=_validate, log=lambda s: console.print(s, markup=False, highlight=False),
     )
     gate = stats_gate.apply_provenance_guard(result.gate, holdout)
     n_real = sum(1 for e in holdout if stats_gate.is_real_example(e))
@@ -258,7 +258,8 @@ def evolve(
         staged_path = manifest["staged_path"]
         promoted = manifest.get("status") == "promoted"
         console.print(f"\n  staged → {staged_path}")
-        console.print(f"  manifest → {staging.manifest_path(skill_name)}")
+        console.print("  manifest → " + (str(Path(staged_path).parent / "manifest.json") + " (rejected; live staging manifest untouched)"
+                                          if manifest.get("status") == "rejected" else str(staging.manifest_path(skill_name))))
         if manifest.get("promotion_error"):
             console.print(f"[red]  promotion aborted: {manifest['promotion_error']}[/red]")
         elif promoted:

@@ -317,7 +317,27 @@ def list_staged(root=None) -> list[dict]:
 def finalize(artifact: str, artifact_type: str, live_path: Path, candidate_text: str,
              stats: dict, *, apply: bool = False, force_promote: bool = False, root=None,
              extra_files: Optional[dict] = None) -> dict:
-    """Stage, then promote iff force_promote or (decision=='promote' and apply)."""
+    """Stage, then promote iff force_promote or (decision=='promote' and apply).
+
+    A 'reject' decision is recorded only in its run dir (output/<artifact>/<ts>/manifest.json)
+    and does NOT replace staging/<artifact>.json, so a pending staged candidate is never
+    displaced by a losing run.
+    """
+    if stats.get("decision") == "reject" and not force_promote:
+        ts = _ts()
+        run_dir = output_dir(root) / _safe(artifact) / ts
+        staged = run_dir / _FILENAMES.get(artifact_type, f"evolved_{artifact_type}.txt")
+        _atomic_write(staged, candidate_text)
+        for name, content in (extra_files or {}).items():
+            _atomic_write(run_dir / name, content if isinstance(content, str) else json.dumps(content, indent=2))
+        m = {"artifact": artifact, "artifact_type": artifact_type, "timestamp": ts,
+             "live_path": str(live_path), "staged_path": str(staged),
+             "live_sha256_at_staging": sha256_file(Path(live_path)),
+             "candidate_sha256": sha256_text(candidate_text), "stats": stats,
+             "decision": "reject", "status": "rejected", "history": []}
+        _atomic_write(run_dir / "manifest.json", json.dumps(m, indent=2, default=str))
+        enforce_size_cap(root=root)
+        return m
     m = stage(artifact, artifact_type, live_path, candidate_text, stats, root, extra_files)
     want = force_promote or (stats.get("decision") == "promote" and apply)
     if want:

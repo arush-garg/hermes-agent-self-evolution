@@ -56,6 +56,15 @@ class TestStage:
         assert m["status"] == "promoted"
 
 
+    def test_reject_does_not_replace_pending_manifest(self, env):
+        root, live = env
+        staging.finalize("demo", "skill", live, EVOLVED, {"decision": "stage"}, root=root)
+        m = staging.finalize("demo", "skill", live, EVOLVED + "x", {"decision": "reject"}, apply=True, root=root)
+        assert m["status"] == "rejected" and live.read_text() == SKILL
+        assert staging.load_manifest("demo", root=root)["decision"] == "stage"
+        assert (Path(m["staged_path"]).parent / "manifest.json").exists()
+
+
 class TestPromoteRollback:
     def test_promote_backup_and_rollback(self, env):
         root, live = env
