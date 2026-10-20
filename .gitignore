@@ -20,6 +20,9 @@ output/
 snapshots/
 *.pkl
 
+# Daily runner logs
+logs/
+
 # IDE
 .idea/
 .vscode/

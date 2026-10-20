@@ -26,16 +26,19 @@ class EvolutionConfig:
     iterations: int = 10
     population_size: int = 5
 
-    # LLM configuration
-    optimizer_model: str = "anthropic/claude-opus-4-8"           # Model for GEPA reflections
-    eval_model: str = "anthropic/claude-haiku-4-5-20251001"      # Model for LLM-as-judge scoring
-    judge_model: str = "anthropic/claude-sonnet-4-6"             # Model for dataset generation
+    # LLM configuration — default to None so resolve_model() uses
+    # PROVIDER_DEFAULTS (which respect HERMES_LLM_PROVIDER). When
+    # HERMES_LLM_PROVIDER=omniroute (default), these resolve to
+    # openai/optimizer and openai/eval combo names.
+    optimizer_model: Optional[str] = None  # Model for GEPA reflections
+    eval_model: Optional[str] = None       # Model for LLM-as-judge scoring
+    judge_model: Optional[str] = None      # Model for dataset generation
 
     # Constraints
     max_skill_size: int = 15_000  # 15KB default
     max_tool_desc_size: int = 500  # chars
     max_param_desc_size: int = 200  # chars
-    max_prompt_growth: float = 0.2  # 20% max growth over baseline
+    max_prompt_growth: float = 2.0  # 200% max growth over baseline — allows meaningful elaboration while absolute size_limit (15KB) is the hard cap
 
     # Eval dataset
     eval_dataset_size: int = 20  # Total examples to generate

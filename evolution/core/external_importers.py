@@ -35,6 +35,7 @@ from rich.console import Console
 from rich.progress import Progress
 
 from evolution.core.dataset_builder import EvalExample, EvalDataset
+from evolution.core.llm_api import get_lm
 
 console = Console()
 
@@ -184,7 +185,7 @@ def _message_get(msg: Any, key: str, default: Any = "") -> Any:
 
 
 def _extract_pairs_from_messages(
-    session_messages: list, out: list[dict], limit: int = 0,
+    session_messages: list, out: list[dict], limit: int = 0, source: str = "hermes",
 ) -> None:
     """Pair user messages with the next assistant response.
 
@@ -225,7 +226,7 @@ def _extract_pairs_from_messages(
             continue
 
         out.append({
-            "source": "hermes",
+            "source": source,
             "task_input": user_text,
             "assistant_response": assistant_text,
             "session_id": _message_get(msg, "session_id", ""),
@@ -236,25 +237,101 @@ def _extract_pairs_from_messages(
 
 
 class ClaudeCodeImporter:
-    """Import user prompts from Claude Code history.jsonl.
+    """Import conversations from Claude Code session transcripts.
 
-    Claude Code stores a flat JSONL of user messages at ~/.claude/history.jsonl.
-    Each line has: display (user text), timestamp, project, sessionId.
-    Only user inputs are available — no assistant responses.
+    Claude Code stores full session transcripts as JSONL files under
+    ~/.claude/projects/<project-hash>/<session-id>.jsonl. Each line is
+    a JSON object with type "user" or "assistant" containing the message
+    content. This gives both user prompts and assistant responses.
+
+    Falls back to ~/.claude/history.jsonl (user-only) if no project
+    sessions are found.
     """
 
+    PROJECTS_DIR = Path.home() / ".claude" / "projects"
     HISTORY_PATH = Path.home() / ".claude" / "history.jsonl"
 
     @staticmethod
+    def _parse_content(content: Any) -> str:
+        """Extract text from a message content field (string or block list)."""
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            parts = []
+            for block in content:
+                if isinstance(block, dict) and block.get("type") == "text":
+                    parts.append(block.get("text", ""))
+            return "\n".join(parts)
+        return ""
+
+    @staticmethod
     def extract_messages(limit: int = 0) -> list[dict]:
-        """Read user messages from Claude Code history.
+        """Read user/assistant pairs from Claude Code session transcripts.
+
+        Reads from ~/.claude/projects/*/*.jsonl (full conversation history).
+        Falls back to ~/.claude/history.jsonl (user inputs only) if no
+        project sessions exist.
 
         Args:
             limit: Maximum messages to return (0 = no limit).
 
         Returns:
-            List of dicts with keys: source, task_input, project, session_id, timestamp.
+            List of dicts with keys: source, task_input, assistant_response,
+            project, session_id.
         """
+        projects_dir = ClaudeCodeImporter.PROJECTS_DIR
+        session_files = sorted(projects_dir.glob("*/*.jsonl")) if projects_dir.exists() else []
+
+        if not session_files:
+            return ClaudeCodeImporter._extract_from_history(limit)
+
+        messages: list[dict] = []
+
+        for session_file in session_files:
+            session_msgs: list[dict] = []
+            session_id = session_file.stem
+            cwd = ""
+
+            try:
+                for line in session_file.read_text(errors="replace").splitlines():
+                    if not line.strip():
+                        continue
+                    try:
+                        obj = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+
+                    msg_type = obj.get("type")
+                    if msg_type not in ("user", "assistant"):
+                        continue
+
+                    cwd = obj.get("cwd", cwd)
+                    session_id = obj.get("sessionId", session_id)
+                    raw_content = obj.get("message", {}).get("content", "")
+                    text = ClaudeCodeImporter._parse_content(raw_content)
+
+                    if not text or not text.strip():
+                        continue
+
+                    session_msgs.append({
+                        "role": msg_type,
+                        "content": text,
+                        "session_id": session_id,
+                        "project": cwd,
+                    })
+            except OSError:
+                continue
+
+            _extract_pairs_from_messages(session_msgs, messages, limit, source="claude-code")
+
+            if limit and len(messages) >= limit:
+                break
+
+        return messages
+
+    @staticmethod
+    def _extract_from_history(limit: int = 0) -> list[dict]:
+        """Fallback: read user inputs from ~/.claude/history.jsonl."""
         if not ClaudeCodeImporter.HISTORY_PATH.exists():
             return []
 
@@ -279,6 +356,7 @@ class ClaudeCodeImporter:
                 messages.append({
                     "source": "claude-code",
                     "task_input": text,
+                    "assistant_response": "",
                     "project": entry.get("project", ""),
                     "session_id": entry.get("sessionId", ""),
                     "timestamp": entry.get("timestamp", 0),
@@ -435,7 +513,10 @@ class HermesSessionImporter:
 
     @staticmethod
     def extract_messages(limit: int = 0) -> list[dict]:
-        """Read user/assistant pairs from Hermes session JSON files.
+        """Read user/assistant pairs from Hermes session JSON files and state.db.
+
+        Combines results from both ~/.hermes/sessions/*.json and the SQLite
+        state.db, deduplicating by task_input so neither source is double-counted.
 
         Args:
             limit: Maximum messages to return (0 = no limit).
@@ -444,25 +525,41 @@ class HermesSessionImporter:
             List of dicts with keys: source, task_input, assistant_response,
             session_id.
         """
+        messages: list[dict] = []
+        seen: set[str] = set()
+
+        # Source 1: JSON session files
         session_dir = HermesSessionImporter.SESSION_DIR
-        if not session_dir.exists():
-            return []
+        if session_dir.exists():
+            for json_file in sorted(session_dir.glob("*.json")):
+                try:
+                    data = json.loads(json_file.read_text())
+                except (json.JSONDecodeError, OSError):
+                    continue
 
-        messages = []
-        for json_file in sorted(session_dir.glob("*.json")):
-            try:
-                data = json.loads(json_file.read_text())
-            except (json.JSONDecodeError, OSError):
-                continue
+                session_msgs = data.get("messages", [])
+                if not isinstance(session_msgs, list):
+                    continue
 
-            session_msgs = data.get("messages", [])
-            if not isinstance(session_msgs, list):
-                continue
+                batch: list[dict] = []
+                _extract_pairs_from_messages(session_msgs, batch, 0, source="hermes")
+                for m in batch:
+                    key = m["task_input"][:200]
+                    if key not in seen:
+                        seen.add(key)
+                        messages.append(m)
+                        if limit and len(messages) >= limit:
+                            return messages
 
-            _extract_pairs_from_messages(session_msgs, messages, limit)
-            if limit and len(messages) >= limit:
-                messages = messages[:limit]
-                break
+        # Source 2: SQLite state.db (primary store for most Hermes installs)
+        db_messages = HermesSessionImporter.extract_messages_from_db(limit=0)
+        for m in db_messages:
+            key = m["task_input"][:200]
+            if key not in seen:
+                seen.add(key)
+                messages.append(m)
+                if limit and len(messages) >= limit:
+                    return messages
 
         return messages
 
@@ -617,7 +714,7 @@ class RelevanceFilter:
         parse_failures = 0
         error_samples = []
         parse_samples = []
-        lm = dspy.LM(self.model)
+        lm = get_lm(self.model)
         max_initial_failures = 5
 
         with Progress() as progress:
@@ -838,7 +935,7 @@ def build_dataset_from_external(
     skill_text: str,
     sources: list[str],
     output_path: Path,
-    model: str,
+    model: Optional[str] = None,
     max_examples: int = 50,
 ) -> EvalDataset:
     """Extract messages from external tools, filter for relevance, and save.
@@ -881,6 +978,10 @@ def build_dataset_from_external(
     console.print(f"\n[bold]Total messages: {len(all_messages)}[/bold]")
     console.print(f"[bold]Filtering for relevance to skill: {skill_name}[/bold]")
 
+    # If no model specified, resolve from provider defaults
+    if model is None:
+        from evolution.core.llm_api import resolve_model
+        model = resolve_model("judge")
     relevance_filter = RelevanceFilter(model=model)
     examples = relevance_filter.filter_and_score(
         all_messages, skill_name, skill_text, max_examples=max_examples,

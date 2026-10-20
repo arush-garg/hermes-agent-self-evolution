@@ -36,8 +36,8 @@ class ConstraintValidator:
         """Run all applicable constraints. Returns list of results."""
         results = []
 
-        # 1. Size limits
-        results.append(self._check_size(artifact_text, artifact_type))
+        # 1. Size limits (relative to baseline when available)
+        results.append(self._check_size(artifact_text, artifact_type, baseline_text))
 
         # 2. Growth limit (if baseline provided)
         if baseline_text:
@@ -92,8 +92,38 @@ class ConstraintValidator:
                 message=f"Failed to run tests: {e}",
             )
 
-    def _check_size(self, text: str, artifact_type: str) -> ConstraintResult:
+    def _check_size(
+        self,
+        text: str,
+        artifact_type: str,
+        baseline_text: str | None = None,
+    ) -> ConstraintResult:
         size = len(text)
+
+        if baseline_text is not None:
+            # Relative limit: artifact can only grow by max_growth% from baseline.
+            # This replaces the old absolute 15K ceiling — large baseline skills
+            # (e.g. 46K reference docs) are not penalised for being large.
+            max_allowed = len(baseline_text) * (1 + self.config.max_prompt_growth)
+            if size <= max_allowed:
+                return ConstraintResult(
+                    passed=True,
+                    constraint_name="size_limit",
+                    message=f"Size OK: {size} ({size/len(baseline_text):+.1%} from baseline {len(baseline_text)})",
+                )
+            else:
+                return ConstraintResult(
+                    passed=False,
+                    constraint_name="size_limit",
+                    message=(
+                        f"Size grew {size/len(baseline_text):+.1%} "
+                        f"({size} vs baseline {len(baseline_text)}, "
+                        f"max allowed: {max_allowed:+.1%})"
+                    ),
+                )
+
+        # No baseline — absolute sanity cap (first-run baseline creation).
+        # Use the per-type limit as a hard ceiling for new artifacts.
         if artifact_type == "skill":
             limit = self.config.max_skill_size
         elif artifact_type == "tool_description":
@@ -101,7 +131,7 @@ class ConstraintValidator:
         elif artifact_type == "param_description":
             limit = self.config.max_param_desc_size
         else:
-            limit = self.config.max_skill_size  # Default
+            limit = self.config.max_skill_size
 
         if size <= limit:
             return ConstraintResult(

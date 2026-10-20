@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from typing import Optional
 
 from evolution.core.config import EvolutionConfig
+from evolution.core.llm_api import get_lm_for_role
 
 
 @dataclass
@@ -72,7 +73,7 @@ class LLMJudge:
     ) -> FitnessScore:
         """Score an agent output using LLM-as-judge."""
 
-        lm = dspy.LM(self.config.eval_model)
+        lm = get_lm_for_role("judge", override=self.config.judge_model)
 
         with dspy.context(lm=lm):
             result = self.judge(
@@ -104,16 +105,16 @@ class LLMJudge:
         )
 
 
-def skill_fitness_metric(example: dspy.Example, prediction: dspy.Prediction, trace=None) -> float:
-    """DSPy-compatible metric function for skill optimization.
+def skill_fitness_metric(gold, pred, trace=None, pred_name=None, pred_trace=None) -> float:
+    """DSPy-compatible metric function for skill optimization (GEPA v2).
 
     This is what gets passed to dspy.GEPA(metric=...).
     Returns a float 0-1 score.
     """
     # The prediction should have an 'output' field with the agent's response
-    agent_output = getattr(prediction, "output", "") or ""
-    expected = getattr(example, "expected_behavior", "") or ""
-    task = getattr(example, "task_input", "") or ""
+    agent_output = getattr(pred, "output", "") or ""
+    expected = getattr(gold, "expected_behavior", "") or ""
+    task = getattr(gold, "task_input", "") or ""
 
     if not agent_output.strip():
         return 0.0

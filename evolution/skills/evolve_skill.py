@@ -23,6 +23,8 @@ from evolution.core.dataset_builder import SyntheticDatasetBuilder, EvalDataset,
 from evolution.core.external_importers import build_dataset_from_external
 from evolution.core.fitness import skill_fitness_metric, LLMJudge, FitnessScore
 from evolution.core.constraints import ConstraintValidator
+from evolution.core.llm_api import configure_default_lm, get_lm_for_role
+from evolution.core.regression_gate import check_regression
 from evolution.skills.skill_module import (
     SkillModule,
     load_skill,
@@ -38,11 +40,12 @@ def evolve(
     iterations: int = 10,
     eval_source: str = "synthetic",
     dataset_path: Optional[str] = None,
-    optimizer_model: str = "anthropic/claude-opus-4-8",
-    eval_model: str = "anthropic/claude-haiku-4-5-20251001",
+    optimizer_model: Optional[str] = None,
+    eval_model: Optional[str] = None,
     hermes_repo: Optional[str] = None,
     run_tests: bool = False,
     dry_run: bool = False,
+    apply: bool = False,
 ):
     """Main evolution function — orchestrates the full optimization loop."""
 
@@ -51,7 +54,7 @@ def evolve(
         iterations=iterations,
         optimizer_model=optimizer_model,
         eval_model=eval_model,
-        judge_model=eval_model,  # Use same model for dataset generation
+        judge_model=None,
         run_pytest=run_tests,
     )
 
@@ -141,9 +144,9 @@ def evolve(
     console.print(f"  Optimizer model: {optimizer_model}")
     console.print(f"  Eval model: {eval_model}")
 
-    # Configure DSPy
-    lm = dspy.LM(eval_model)
-    dspy.configure(lm=lm)
+    # Global default LM — GEPA uses dspy.settings.lm for student evaluation
+    configure_default_lm("eval", override=eval_model, temperature=0.0)
+    lm = get_lm_for_role("eval", override=eval_model, temperature=0.0)
 
     # Create the baseline skill module
     baseline_module = SkillModule(skill["body"])
@@ -158,9 +161,11 @@ def evolve(
     start_time = time.time()
 
     try:
+        reflection_lm = get_lm_for_role("optimizer", override=optimizer_model)
         optimizer = dspy.GEPA(
             metric=skill_fitness_metric,
-            max_steps=iterations,
+            max_full_evals=iterations,
+            reflection_lm=reflection_lm,
         )
 
         optimized_module = optimizer.compile(
@@ -222,7 +227,7 @@ def evolve(
     evolved_scores = []
     for ex in holdout_examples:
         # Score baseline
-        with dspy.context(lm=lm):
+        with dspy.context(lm=get_lm_for_role("eval", override=eval_model, temperature=0.0)):
             baseline_pred = baseline_module(task_input=ex.task_input)
             baseline_score = skill_fitness_metric(ex, baseline_pred)
             baseline_scores.append(baseline_score)
@@ -234,6 +239,15 @@ def evolve(
     avg_baseline = sum(baseline_scores) / max(1, len(baseline_scores))
     avg_evolved = sum(evolved_scores) / max(1, len(evolved_scores))
     improvement = avg_evolved - avg_baseline
+
+    # ── 9a. Regression gate ─────────────────────────────────────────
+    passed_gate = check_regression(
+        improvement=improvement,
+        baseline_score=avg_baseline,
+        evolved_score=avg_evolved,
+        artifact_type="skill",
+        artifact_name=skill_name,
+    )
 
     # ── 9. Report results ───────────────────────────────────────────────
     table = Table(title="Evolution Results")
@@ -294,9 +308,14 @@ def evolve(
 
     console.print(f"\n  Output saved to {output_dir}/")
 
-    if improvement > 0:
+    if passed_gate:
         console.print(f"\n[bold green]✓ Evolution improved skill by {improvement:+.3f} ({improvement/max(0.001, avg_baseline)*100:+.1f}%)[/bold green]")
         console.print(f"  Review the diff: diff {output_dir}/baseline_skill.md {output_dir}/evolved_skill.md")
+        if apply:
+            skill_path.write_text(evolved_full)
+            console.print(f"\n[bold green]✓ Applied evolved skill → {skill_path}[/bold green]")
+        else:
+            console.print(f"  To apply: cp {output_dir}/evolved_skill.md {skill_path}")
     else:
         console.print(f"\n[yellow]⚠ Evolution did not improve skill (change: {improvement:+.3f})[/yellow]")
         console.print("  Try: more iterations, better eval dataset, or different optimizer model")
@@ -308,12 +327,13 @@ def evolve(
 @click.option("--eval-source", default="synthetic", type=click.Choice(["synthetic", "golden", "sessiondb"]),
               help="Source for evaluation dataset")
 @click.option("--dataset-path", default=None, help="Path to existing eval dataset (JSONL)")
-@click.option("--optimizer-model", default="anthropic/claude-opus-4-8", help="Model for GEPA reflections")
-@click.option("--eval-model", default="anthropic/claude-haiku-4-5-20251001", help="Model for evaluations")
+@click.option("--optimizer-model", default=None, help="Model for GEPA reflections (default: provider default via HERMES_LLM_PROVIDER)")
+@click.option("--eval-model", default=None, help="Model for evaluations (default: provider default via HERMES_LLM_PROVIDER)")
 @click.option("--hermes-repo", default=None, help="Path to hermes-agent repo")
 @click.option("--run-tests", is_flag=True, help="Run full pytest suite as constraint gate")
 @click.option("--dry-run", is_flag=True, help="Validate setup without running optimization")
-def main(skill, iterations, eval_source, dataset_path, optimizer_model, eval_model, hermes_repo, run_tests, dry_run):
+@click.option("--apply", is_flag=True, help="Write evolved skill back to its source SKILL.md if improvement > 0")
+def main(skill, iterations, eval_source, dataset_path, optimizer_model, eval_model, hermes_repo, run_tests, dry_run, apply):
     """Evolve a Hermes Agent skill using DSPy + GEPA optimization."""
     evolve(
         skill_name=skill,
@@ -325,6 +345,7 @@ def main(skill, iterations, eval_source, dataset_path, optimizer_model, eval_mod
         hermes_repo=hermes_repo,
         run_tests=run_tests,
         dry_run=dry_run,
+        apply=apply,
     )
 
 

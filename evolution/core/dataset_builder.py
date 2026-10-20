@@ -15,6 +15,7 @@ from typing import Optional
 import dspy
 
 from evolution.core.config import EvolutionConfig
+from evolution.core.llm_api import get_lm_for_role
 
 
 @dataclass
@@ -86,6 +87,67 @@ class EvalDataset:
         ]
 
 
+# ── Fallback case generation ───────────────────────────────────────────────
+
+def _fallback_cases(artifact_text: str, n: int = 5) -> list[dict]:
+    """Generate minimal test cases from artifact text using heuristics.
+
+    Used when LLM output is completely unparseable. Extracts key phrases
+    from the text and wraps them in simple (task_input, expected_behavior)
+    pairs so that optimisation can still proceed (even if with low-quality
+    evaluation).
+    """
+    import sys
+
+    # Strip frontmatter / markdown fences
+    text = artifact_text
+    if text.startswith("---"):
+        _, _, text = text.partition("---")
+        _, _, text = text.partition("---")
+    text = "\n".join(
+        line for line in text.splitlines()
+        if not line.startswith("```")
+    )
+
+    # Pick topic sentences (first ~20 non-empty lines)
+    lines = [l.strip() for l in text.splitlines() if l.strip()]
+    topics = lines[: min(20, len(lines))]
+
+    # Build pairs from every other sentence
+    cases: list[dict] = []
+    difficulties = ["easy", "medium", "hard"]
+    categories = ["general", "edge_case", "integration"]
+
+    for i in range(0, min(n * 2, len(topics)), 2):
+        topic_a = topics[i] if i < len(topics) else ""
+        topic_b = topics[i + 1] if i + 1 < len(topics) else "follow instructions"
+        if not topic_a:
+            continue
+        cases.append({
+            "task_input": f"Apply {topic_a[:120]}",
+            "expected_behavior": topic_b[:200] if topic_b else f"Respond correctly about {topic_a[:80]}",
+            "difficulty": difficulties[i % len(difficulties)],
+            "category": categories[i % len(categories)],
+        })
+        if len(cases) >= n:
+            break
+
+    if not cases:
+        # absolute last resort
+        cases.append({
+            "task_input": "Perform the described task",
+            "expected_behavior": "Follow the instructions correctly and completely",
+            "difficulty": "medium",
+            "category": "general",
+        })
+
+    print(
+        f"  [dataset_fallback] Generated {len(cases)} heuristic cases from artifact text.",
+        file=sys.stderr,
+    )
+    return cases
+
+
 class SyntheticDatasetBuilder:
     """Generate evaluation datasets using a strong LLM.
 
@@ -122,8 +184,7 @@ class SyntheticDatasetBuilder:
 
         n = num_cases or self.config.eval_dataset_size
 
-        # Configure DSPy to use the judge model for generation
-        lm = dspy.LM(self.config.judge_model)
+        lm = get_lm_for_role("judge", override=self.config.judge_model)
 
         with dspy.context(lm=lm):
             result = self.generator(
@@ -133,16 +194,65 @@ class SyntheticDatasetBuilder:
             )
 
         # Parse the generated test cases
+        # The LLM often wraps the JSON array in markdown fences or adds surrounding text.
+        # We attempt a series of increasingly tolerant parses:
+        # 1. Direct JSON load – works when the model returns clean JSON.
+        # 2. Strip common markdown fences (e.g. ```json ... ```) and retry.
+        # 3. Fallback to a balanced‑bracket extractor that finds the first top‑level JSON
+        #    array without being greedy (handles nested brackets correctly).
+        def _extract_balanced_array(text: str) -> Optional[str]:
+            """Return the first balanced ``[ ... ]`` substring or ``None``.
+
+            This scans the string character‑by‑character, counting brackets, and stops
+            when the opening bracket that started at position ``i`` is closed. It
+            therefore avoids the greedy ``r'\\[.*\\]'`` pattern that would swallow the
+            last ``]`` in the entire response.
+            """
+
+            start = text.find('[')
+            if start == -1:
+                return None
+            depth = 0
+            for idx in range(start, len(text)):
+                if text[idx] == '[':
+                    depth += 1
+                elif text[idx] == ']':
+                    depth -= 1
+                    if depth == 0:
+                        return text[start : idx + 1]
+            return None
+
         try:
             cases_raw = json.loads(result.test_cases)
         except json.JSONDecodeError:
-            # Try to extract JSON from the response
+            # Strip markdown code fences if present.
             import re
-            match = re.search(r'\[.*\]', result.test_cases, re.DOTALL)
-            if match:
-                cases_raw = json.loads(match.group())
+
+            # Typical pattern: ```json\n[ ... ]\n``` (case‑insensitive ``json`` label optional)
+            fence_match = re.search(r'```\s*json?\s*(\[.*?\])\s*```', result.test_cases, re.DOTALL | re.IGNORECASE)
+            if fence_match:
+                try:
+                    cases_raw = json.loads(fence_match.group(1))
+                except json.JSONDecodeError:
+                    # Fallback to balanced‑bracket extraction on the captured group.
+                    raw = _extract_balanced_array(fence_match.group(1))
+                    if raw:
+                        cases_raw = json.loads(raw)
+                    else:
+                        raise
             else:
-                raise ValueError(f"Could not parse test cases from LLM output: {result.test_cases[:200]}")
+                # Try balanced bracket extraction on the whole output.
+                raw = _extract_balanced_array(result.test_cases)
+                if raw:
+                    cases_raw = json.loads(raw)
+                else:
+                    # Last resort: fallback to minimal heuristic-based cases
+                    cases_raw = _fallback_cases(artifact_text, n)
+                    if cases_raw:
+                        print(f"  [warn] LLM output unparseable, using {len(cases_raw)} heuristic fallback cases.", file=sys.stderr)
+                    else:
+                        preview = result.test_cases[:300]
+                        raise ValueError(f"Could not parse test cases from LLM output: {preview}")
 
         examples = [
             EvalExample(
