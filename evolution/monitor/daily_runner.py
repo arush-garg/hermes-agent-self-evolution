@@ -422,13 +422,27 @@ def main() -> None:
 
     ts = datetime.now().strftime("%Y-%m-%d_%H%M%S")
     from evolution.core.housekeeping import housekeeping
-    usage = housekeeping(REPO_ROOT, dry_run=args.dry_run)
-    print(f"Housekeeping (bytes): {usage['before']} -> {usage['after']}")
+    if args.dry_run:
+        # Dry run is strictly read-only: no runner log, no symlink, no housekeeping writes,
+        # no state/log updates. Print the plan and proposed selection only.
+        hk = housekeeping(REPO_ROOT, dry_run=True)
+        print(f"[dry-run] Housekeeping plan: {json.dumps(hk['plan'])}")
+        print(f"[dry-run] Housekeeping usage (bytes): {hk['before']} -> projected {hk['projected']}")
+        acts = hk['actions']
+        print(f"[dry-run] Housekeeping would perform {len(acts)} action(s)"
+              + (": " + "; ".join(acts[:10]) + (" ..." if len(acts) > 10 else "") if acts else ""))
+        _main(args)
+        return
+
     logs_dir = REPO_ROOT / "logs"
     logs_dir.mkdir(exist_ok=True)
 
     runner_log = logs_dir / f"daily_runner_{ts}.log"
     runner_latest = logs_dir / "daily_runner_latest.log"
+    # Enforce disk caps on every real run, before creating new artifacts; never touch
+    # the current run's log.
+    usage = housekeeping(REPO_ROOT, dry_run=False, protect=[runner_log])
+    print(f"Housekeeping (bytes): {usage['before']} -> {usage['after']}")
     if runner_latest.exists() or runner_latest.is_symlink():
         runner_latest.unlink()
     runner_latest.symlink_to(runner_log.name)
@@ -452,7 +466,7 @@ def main() -> None:
     sys.stderr = _Tee(_orig_stderr, runner_fh)
 
     try:
-        _main(args)
+        _main(args, protect=[runner_log])
     except BaseException as e:
         import traceback
         traceback.print_exc(file=sys.stderr)
@@ -463,7 +477,7 @@ def main() -> None:
         runner_fh.close()
 
 
-def _main(args) -> None:
+def _main(args, protect=()) -> None:
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     print(f"[{now_str}] Starting self-evolution gauntlet")
 
@@ -512,9 +526,14 @@ def _main(args) -> None:
         cmd = build_command(pipeline_type, artifact)
         print(f"\n[dry-run] Would run:\n  {' '.join(cmd)}")
         from evolution.core.failure_mining import mine
-        print(f"[dry-run] Failure context: {json.dumps(mine(days=30)[:3])}")
-        from evolution.core.housekeeping import housekeeping
-        print(f"[dry-run] Housekeeping plan: {json.dumps(housekeeping(REPO_ROOT, dry_run=True)['plan'])}")
+        row = next((r for r in mine(days=30) if r['artifact'] == artifact), None)
+        if row:
+            print(f"[dry-run] Failure evidence for {artifact}: score={row['score']} "
+                  f"failure_sessions={row['failure_sessions']} correction_sessions={row['correction_sessions']}")
+            for f in row['failures'][:3]:
+                print(f"    {f['tool']} x{f['sessions']}: {f['error_signature'][:120]}")
+        else:
+            print(f"[dry-run] Failure evidence for {artifact}: none")
         return
 
     # ── Run ────────────────────────────────────────────────────────────
@@ -570,6 +589,12 @@ def _main(args) -> None:
     else:
         print("  Evolution failed.", file=sys.stderr)
         sys.exit(1)
+
+    # ── Housekeeping (after evolution, not before; dry-run handled earlier) ─────
+    if not dry_run:
+        from evolution.core.housekeeping import housekeeping
+        usage = housekeeping(REPO_ROOT, dry_run=False, protect=protect)
+        print(f"Housekeeping (bytes): {usage['before']} -> {usage['after']}")
 
 
 if __name__ == "__main__":

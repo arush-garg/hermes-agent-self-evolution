@@ -152,3 +152,33 @@ class TestWriteLogEntry:
             assert len(lines) == 2
         finally:
             runner_module.REPO_ROOT = original_repo
+
+
+class TestDryRunReadOnly:
+    def test_dry_run_main_mutates_nothing(self, tmp_path, monkeypatch, capsys):
+        import sys as _sys
+        from pathlib import Path as _P
+        import evolution.monitor.daily_runner as dr
+        repo = tmp_path / "repo"
+        logs = repo / "logs"; logs.mkdir(parents=True)
+        (logs / "big.log").write_bytes(b"x" * (6 * 1024 * 1024))
+        for i in range(5):
+            d = repo / "output" / "s" / f"r{i}"; d.mkdir(parents=True); (d / "m.json").write_text("{}")
+        (repo / "datasets").mkdir()
+        state = logs / "evolution_schedule.json"
+        state.write_text(json.dumps({"tick": 0, "pipelines": {}, "stale_skills": {}}))
+        snap = lambda: {str(p): (p.lstat().st_mtime_ns, p.lstat().st_size) for p in repo.rglob("*")}
+        before = snap()
+        monkeypatch.setattr(dr, "REPO_ROOT", repo)
+        monkeypatch.setattr(dr, "STATE_FILE", state)
+        monkeypatch.setattr(dr, "select_pipeline", lambda st, dry_run: ("skills", "demo-skill"))
+        monkeypatch.setattr("evolution.core.failure_mining.mine", lambda days=30, db_path=None: [])
+        monkeypatch.setattr(dr, "run_evolution", lambda *a, **k: (_ for _ in ()).throw(AssertionError("ran evolution")))
+        monkeypatch.setattr(_sys, "argv", ["daily_runner", "--dry-run"])
+        dr.main()
+        out = capsys.readouterr().out
+        assert snap() == before
+        assert "[dry-run] Housekeeping would perform" in out and "rotate_log" in out
+        assert "Would run" in out and "demo-skill" in out
+        assert "Housekeeping (bytes)" not in out
+        assert len(out) < 4000

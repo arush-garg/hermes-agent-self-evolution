@@ -305,9 +305,9 @@ def build_mixed_dataset(skill_name: str, skill_text: str, output_path: Path,
                         config: EvolutionConfig, minimum: int = 12) -> EvalDataset:
     """Replay real tasks first; top up scarce data with synthetic cases.
 
-    Session boundaries and chronological holdout are preserved. Synthetic cases never
-    reuse a real session id; when real history is sparse, at least 8 holdout cases
-    are allocated for a meaningful regression gate.
+    Session boundaries and chronological holdout are preserved. Synthetic cases
+    ONLY go to train/val (never holdout). When real history is sparse, holdout
+    may have < 8 cases and will be stage-only (not used for regression gate).
     """
     from evolution.core.trajectory_replay import replay
     real = replay(skill_name, limit=100)
@@ -322,13 +322,12 @@ def build_mixed_dataset(skill_name: str, skill_text: str, output_path: Path,
         val=[e for sid in ids[len(ids)-n_hold-n_val:len(ids)-n_hold] for e in by_session[sid]],
         holdout=[e for sid in ids[len(ids)-n_hold:] for e in by_session[sid]],
     )
-    needed = max(0, minimum - len(real), 8 - len(dataset.holdout))
+    needed = max(0, minimum - len(real))
     if needed:
         synthetic = SyntheticDatasetBuilder(config).generate(skill_text, num_cases=max(needed + 3, 12))
         extras = synthetic.all_examples
-        while len(dataset.holdout) < 8 and extras:
-            dataset.holdout.append(extras.pop())
-        for i, ex in enumerate(extras[:max(0, minimum-len(dataset.all_examples))]):
+        # Synthetic cases ONLY go to train/val (never holdout)
+        for i, ex in enumerate(extras[:max(0, minimum - len(dataset.all_examples))]):
             (dataset.val if i % 3 == 0 else dataset.train).append(ex)
     dataset.save(output_path)
     return dataset

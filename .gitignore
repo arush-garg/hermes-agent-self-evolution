@@ -10,6 +10,10 @@ build/
 venv/
 .env
 
+# macOS
+.DS_Store
+**/.DS_Store
+
 # Generated eval datasets (local, not shared)
 datasets/**/*.jsonl
 datasets/**/*.json
@@ -28,6 +32,9 @@ logs/
 .vscode/
 *.swp
 *.swo
+
+# Worktree artifacts (do not track)
+.claude/worktrees/
 
 # Staged evolution candidates, manifests, backups (evolution.core.staging)
 staging/
