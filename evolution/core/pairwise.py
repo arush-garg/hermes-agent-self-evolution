@@ -118,7 +118,55 @@ class LLMClient:
         s = str(e).lower()
         return "temperature" in s and ("deprecated" in s or "not supported" in s or "unsupported" in s)
 
+    def _stream(self, model: str, messages, _no_temp: bool = False) -> str:
+        """Streamed chat completion straight against the OpenAI-compatible endpoint."""
+        import urllib.error
+        import urllib.request
+
+        base = os.getenv("OMNIROUTE_BASE_URL", "http://localhost:20128/v1").rstrip("/")
+        name = model.split("/", 1)[1] if model.startswith("openai/") else model
+        body = {"model": name, "messages": messages, "max_tokens": self.max_tokens, "stream": True}
+        if self.temperature is not None and not _no_temp and not getattr(self, "_drop_temp", False):
+            body["temperature"] = self.temperature
+        req = urllib.request.Request(
+            f"{base}/chat/completions", data=json.dumps(body).encode(),
+            headers={"Content-Type": "application/json",
+                     "Authorization": f"Bearer {os.getenv('OMNIROUTE_API_KEY', 'omniroute-no-auth-needed')}"})
+        parts = []
+        try:
+            with urllib.request.urlopen(req, timeout=float(os.getenv("EVOLUTION_STREAM_TIMEOUT", "900"))) as r:
+                for raw in r:
+                    line = raw.decode("utf-8", "replace").strip()
+                    if not line.startswith("data:"):
+                        continue
+                    data = line[5:].strip()
+                    if data == "[DONE]":
+                        break
+                    try:
+                        chunk = json.loads(data)
+                    except ValueError:
+                        continue
+                    if chunk.get("error"):
+                        raise RuntimeError(str(chunk["error"])[:500])
+                    for ch in chunk.get("choices") or []:
+                        parts.append((ch.get("delta") or {}).get("content") or "")
+        except urllib.error.HTTPError as e:
+            err = RuntimeError(f"HTTP {e.code}: {e.read()[:500].decode('utf-8', 'replace')}")
+            if not _no_temp and self.temperature is not None and self._is_temperature_rejection(err):
+                logger.warning("%s model %s rejects temperature; retrying stream without it", self.role, model)
+                self._drop_temp = True
+                return self._stream(model, messages, _no_temp=True)
+            raise err from None
+        text = "".join(parts)
+        if not text.strip():
+            raise RuntimeError(f"empty streamed response from {model}")
+        return text
+
     def _call(self, which: str, model: str, messages):
+        if self.max_tokens and self.max_tokens > 4096 and os.getenv("EVOLUTION_STREAM_LONG", "1") != "0":
+            # Long generations (skill rewrites) exceed OmniRoute's 120s non-stream fetch cap
+            # on every combo member -> 504 cascade. Streaming keeps the connection alive.
+            return self._stream(model, messages)
         lm = getattr(self, which)
         if lm is None:
             lm = self._make(model)

@@ -42,3 +42,25 @@ def test_other_errors_still_raise():
             assert False
         except RuntimeError as e:
             assert "504" in str(e)
+
+
+def test_long_generations_use_streaming(monkeypatch):
+    import io, json as _json, urllib.request
+    from evolution.core import pairwise
+    seen = {}
+
+    class Resp(io.BytesIO):
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+
+    def fake_urlopen(req, timeout=None):
+        seen['body'] = _json.loads(req.data)
+        chunks = [{'choices': [{'delta': {'content': 'Hello '}}]}, {'choices': [{'delta': {'content': 'world'}}]}]
+        payload = b''.join(b'data: ' + _json.dumps(c).encode() + b'\n\n' for c in chunks) + b'data: [DONE]\n\n'
+        return Resp(payload)
+
+    monkeypatch.setattr(urllib.request, 'urlopen', fake_urlopen)
+    c = LLMClient(CallBudget(5), 'optimizer', temperature=0.7, max_tokens=12000, model='openai/optimizer')
+    assert c.chat('rewrite') == 'Hello world'
+    assert seen['body']['stream'] is True and seen['body']['model'] == 'optimizer'
+    assert c.budget.used == 1
