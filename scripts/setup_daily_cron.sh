@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 # Install (or replace) the Hermes self-evolution LaunchAgent.
-# Uses StartInterval (every 2 hours by default) instead of daily cron.
+# Uses StartInterval (daily by default) instead of daily cron.
 # Usage: ./scripts/setup_daily_cron.sh [interval_seconds]
-#   Default interval: 7200 (2 hours)
+#   Default interval: 86400 (24 hours)
 set -euo pipefail
 
 REPO_DIR="$(cd "$(dirname "$0")/.." && pwd)"
-INTERVAL="${1:-7200}"
+INTERVAL="${1:-86400}"
 PLIST_LABEL="com.hermes.skill-evolution"
 PLIST_PATH="$HOME/Library/LaunchAgents/${PLIST_LABEL}.plist"
 
