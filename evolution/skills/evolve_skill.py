@@ -1,38 +1,106 @@
-"""Evolve a Hermes Agent skill using DSPy + GEPA.
+"""Evolve a Hermes Agent skill with Propose → Probe → Compose + pairwise judging.
+
+Decision pipeline (no keyword-overlap metric in the keep/reject path):
+  * K candidate rewrites are proposed (general / domain / lessons-seeded ...),
+  * each is probed pairwise vs the baseline on a small VAL slice,
+  * the top two are merged into a composite,
+  * the best contender (baseline always included) is judged pairwise on
+    HOLDOUT, then gated by a paired bootstrap (:mod:`evolution.core.stats_gate`).
+
+Deployment is STAGED by default (output/<skill>/<ts>/ + staging/<skill>.json).
+The live SKILL.md is only overwritten with ``--promote`` or when
+``decision == 'promote'`` and ``--apply`` — with backup and sha checks
+(:mod:`evolution.core.staging`).
 
 Usage:
-    python -m evolution.skills.evolve_skill --skill github-code-review --iterations 10
-    python -m evolution.skills.evolve_skill --skill arxiv --eval-source golden --dataset datasets/skills/arxiv/
+    python -m evolution.skills.evolve_skill --skill github-workflow --iterations 2 --candidates 2
+    python -m evolution.skills.evolve_skill --skill arxiv --eval-source golden --dataset-path datasets/skills/arxiv/
 """
 
+from __future__ import annotations
+
 import json
+import random
 import sys
 import time
-from pathlib import Path
 from datetime import datetime
+from pathlib import Path
 from typing import Optional
 
 import click
-import dspy
 from rich.console import Console
-from rich.panel import Panel
-from rich.table import Table
 
+from evolution.core import staging
+from evolution.core.compose import (load_failure_context, load_lessons, propose_probe_compose,
+                                    record_lesson)
 from evolution.core.config import EvolutionConfig, resolve_hermes_agent_path
-from evolution.core.dataset_builder import SyntheticDatasetBuilder, EvalDataset, GoldenDatasetLoader
-from evolution.core.external_importers import build_dataset_from_external
-from evolution.core.fitness import skill_fitness_metric, LLMJudge, FitnessScore
 from evolution.core.constraints import ConstraintValidator
-from evolution.core.llm_api import configure_default_lm, get_lm_for_role
-from evolution.core.regression_gate import check_regression
-from evolution.skills.skill_module import (
-    SkillModule,
-    load_skill,
-    find_skill,
-    reassemble_skill,
-)
+from evolution.core.pairwise import CallBudget, LLMClient, PairwiseJudge, summarize
+from evolution.skills.skill_module import find_skill, load_skill, reassemble_skill
 
 console = Console()
+
+EVAL_SOURCES = ["synthetic", "golden", "sessiondb", "mixed"]
+
+
+def _examples_as_dicts(exs) -> list[dict]:
+    out = []
+    for e in exs:
+        if isinstance(e, dict):
+            out.append(e)
+        elif hasattr(e, "to_dict"):
+            out.append(e.to_dict())
+        else:
+            out.append(dict(vars(e)))
+    return out
+
+
+def _load_dataset(skill_name, skill, eval_source, dataset_path, config, eval_model, min_total):
+    from evolution.core.dataset_builder import (EvalDataset, GoldenDatasetLoader,
+                                                SyntheticDatasetBuilder)
+
+    if dataset_path and Path(dataset_path).exists() and eval_source in ("golden", "synthetic", "mixed"):
+        ds = GoldenDatasetLoader.load(Path(dataset_path)) if eval_source == "golden" \
+            else EvalDataset.load(Path(dataset_path))
+        if ds.all_examples:
+            return ds
+    if eval_source == "golden":
+        raise click.UsageError("--eval-source golden requires an existing --dataset-path")
+    if eval_source == "sessiondb":
+        from evolution.core.external_importers import build_dataset_from_external
+        save = Path(dataset_path) if dataset_path else Path("datasets") / "skills" / skill_name
+        return build_dataset_from_external(skill_name=skill_name, skill_text=skill["raw"],
+                                           sources=["claude-code", "copilot", "hermes"],
+                                           output_path=save, model=eval_model)
+    if eval_source == "mixed":
+        from evolution.core.dataset_builder import build_mixed_dataset
+        save = Path(dataset_path) if dataset_path else Path("datasets") / "skills" / skill_name
+        return build_mixed_dataset(skill_name, skill["raw"], save, config, minimum=min_total)
+    builder = SyntheticDatasetBuilder(config)
+    ds = builder.generate(artifact_text=skill["raw"], artifact_type="skill", num_cases=min_total)
+    save = Path("datasets") / "skills" / skill_name
+    ds.save(save)
+    console.print(f"  dataset saved to {save}/")
+    return ds
+
+
+def _resplit(ds, n_val: int, n_holdout_min: int, seed: int):
+    """Ensure holdout has >= n_holdout_min examples (taken from train first). Val is capped."""
+    train, val, hold = (_examples_as_dicts(ds.train), _examples_as_dicts(ds.val),
+                        _examples_as_dicts(ds.holdout))
+    rng = random.Random(seed)
+    pool = train + val
+    while len(hold) < n_holdout_min and len(pool) > 2:
+        hold.append(pool.pop(rng.randrange(len(pool))))
+    train = [e for e in train if e in pool]
+    val = [e for e in val if e in pool]
+    if len(val) < 2 and len(train) > 2:
+        val += [train.pop() for _ in range(min(2, len(train) - 1))]
+    return train, val[:n_val], hold
+
+
+def _emit(result: dict) -> None:
+    print("EVOLUTION_RESULT " + json.dumps(result, default=str), flush=True)
 
 
 def evolve(
@@ -46,9 +114,17 @@ def evolve(
     run_tests: bool = False,
     dry_run: bool = False,
     apply: bool = False,
-):
-    """Main evolution function — orchestrates the full optimization loop."""
-
+    candidates: int = 3,
+    promote: bool = False,
+    min_effect: float = 0.05,
+    repeats: int = 2,
+    max_calls: int = 400,
+    seed: int = 0,
+    val_size: int = 6,
+    holdout_min: int = 10,
+    noise_check: bool = True,
+) -> dict:
+    start = time.time()
     config = EvolutionConfig(
         hermes_agent_path=resolve_hermes_agent_path(hermes_repo),
         iterations=iterations,
@@ -57,296 +133,177 @@ def evolve(
         judge_model=None,
         run_pytest=run_tests,
     )
-
-    # ── 1. Find and load the skill ──────────────────────────────────────
-    console.print(f"\n[bold cyan]🧬 Hermes Agent Self-Evolution[/bold cyan] — Evolving skill: [bold]{skill_name}[/bold]\n")
-
+    console.print(f"\n[bold cyan]🧬 Hermes Agent Self-Evolution[/bold cyan] — skill: [bold]{skill_name}[/bold]")
     skill_path = find_skill(skill_name, config.hermes_agent_path)
     if not skill_path:
-        console.print(f"[red]✗ Skill '{skill_name}' not found in {config.hermes_agent_path / 'skills'}[/red]")
+        console.print(f"[red]✗ Skill '{skill_name}' not found[/red]")
         sys.exit(1)
-
     skill = load_skill(skill_path)
-    # Display path relative to config's skills dir, or absolute if outside
-    try:
-        display_path = skill_path.relative_to(config.hermes_agent_path)
-    except ValueError:
-        display_path = skill_path
-    console.print(f"  Loaded: {display_path}")
-    console.print(f"  Name: {skill['name']}")
-    console.print(f"  Size: {len(skill['raw']):,} chars")
-    console.print(f"  Description: {skill['description'][:80]}...")
-
+    console.print(f"  Loaded: {skill_path} ({len(skill['raw']):,} chars)")
+    console.print(f"  candidates={candidates} repeats={repeats} min_effect={min_effect} "
+                  f"max_calls={max_calls} mode={'PROMOTE' if promote else ('apply-if-significant' if apply else 'stage-only')}")
     if dry_run:
-        console.print(f"\n[bold green]DRY RUN — setup validated successfully.[/bold green]")
-        console.print(f"  Would generate eval dataset (source: {eval_source})")
-        console.print(f"  Would run GEPA optimization ({iterations} iterations)")
-        console.print(f"  Would validate constraints and create PR")
-        return
+        console.print("[bold green]DRY RUN — setup validated.[/bold green]")
+        return {}
 
-    # ── 2. Build or load evaluation dataset ─────────────────────────────
-    console.print(f"\n[bold]Building evaluation dataset[/bold] (source: {eval_source})")
+    budget = CallBudget(max_calls=max_calls)
+    # Rough bound on proposal rounds so --iterations still means something: K proposals per run.
+    k = max(1, min(candidates, max(1, iterations) * 2))
 
-    if eval_source == "golden" and dataset_path:
-        dataset = GoldenDatasetLoader.load(Path(dataset_path))
-        console.print(f"  Loaded golden dataset: {len(dataset.all_examples)} examples")
-    elif eval_source == "sessiondb":
-        save_path = Path(dataset_path) if dataset_path else Path("datasets") / "skills" / skill_name
-        dataset = build_dataset_from_external(
-            skill_name=skill_name,
-            skill_text=skill["raw"],
-            sources=["claude-code", "copilot", "hermes"],
-            output_path=save_path,
-            model=eval_model,
-        )
-        if not dataset.all_examples:
-            console.print("[red]✗ No relevant examples found from session history[/red]")
-            sys.exit(1)
-        console.print(f"  Mined {len(dataset.all_examples)} examples from session history")
-    elif eval_source == "synthetic":
-        builder = SyntheticDatasetBuilder(config)
-        dataset = builder.generate(
-            artifact_text=skill["raw"],
-            artifact_type="skill",
-        )
-        # Save for reuse
-        save_path = Path("datasets") / "skills" / skill_name
-        dataset.save(save_path)
-        console.print(f"  Generated {len(dataset.all_examples)} synthetic examples")
-        console.print(f"  Saved to {save_path}/")
-    elif dataset_path:
-        dataset = EvalDataset.load(Path(dataset_path))
-        console.print(f"  Loaded dataset: {len(dataset.all_examples)} examples")
-    else:
-        console.print("[red]✗ Specify --dataset-path or use --eval-source synthetic[/red]")
-        sys.exit(1)
+    # ── dataset ──
+    min_total = max(config.eval_dataset_size, holdout_min + val_size + 4)
+    console.print(f"\n[bold]Dataset[/bold] (source: {eval_source})")
+    dataset = _load_dataset(skill_name, skill, eval_source, dataset_path, config, eval_model, min_total)
+    budget.spend("dataset")  # synthetic/mixed generation ≈ 1 call (approximate, counted)
+    train, val, holdout = _resplit(dataset, val_size, holdout_min, seed)
+    console.print(f"  train={len(train)} val={len(val)} holdout={len(holdout)}")
+    if not holdout or not val:
+        console.print("[red]✗ dataset too small[/red]")
+        res = dict(success=False, improvement=0.0, ci_low=None, ci_high=None, p_value=None,
+                   decision="reject", staged_path=None, n_pairs=0, error="dataset too small")
+        _emit(res)
+        return res
 
-    console.print(f"  Split: {len(dataset.train)} train / {len(dataset.val)} val / {len(dataset.holdout)} holdout")
+    # ── LLM roles ──
+    agent = LLMClient(budget, "eval", temperature=0.0, max_tokens=2048, model=None)
+    noise_agent = LLMClient(budget, "eval", temperature=0.7, max_tokens=2048, cache=False)
+    optimizer = LLMClient(budget, "optimizer", temperature=0.7, max_tokens=12000)
+    judge_llm = LLMClient(budget, "judge", temperature=0.0, max_tokens=2048, fallback_role="eval")
+    judge = PairwiseJudge(judge_llm, repeats=repeats, seed=seed)
+    console.print(f"  models: agent={agent.model} optimizer={optimizer.model} judge={judge_llm.model}")
 
-    # ── 3. Validate constraints on baseline ─────────────────────────────
-    console.print(f"\n[bold]Validating baseline constraints[/bold]")
+    task_classes = sorted({e.get("task_class") or e.get("category") or "" for e in train + val} | {skill_name})
+    lessons = load_lessons(task_classes)
+    failure_ctx = load_failure_context()
+    console.print(f"  lessons={len(lessons)} failure_context={'yes' if failure_ctx else 'no'}")
+
     validator = ConstraintValidator(config)
-    baseline_constraints = validator.validate_all(skill["raw"], "skill")
-    all_pass = True
-    for c in baseline_constraints:
-        icon = "✓" if c.passed else "✗"
-        color = "green" if c.passed else "red"
-        console.print(f"  [{color}]{icon} {c.constraint_name}[/{color}]: {c.message}")
-        if not c.passed:
-            all_pass = False
 
-    if not all_pass:
-        console.print("[yellow]⚠ Baseline skill has constraint violations — proceeding anyway[/yellow]")
+    def _validate(body: str) -> Optional[str]:
+        full = reassemble_skill(skill["frontmatter"], body)
+        bad = [c for c in validator.validate_all(full, "skill", baseline_text=skill["raw"]) if not c.passed]
+        if bad:
+            return "; ".join(c.message for c in bad)
+        ok, why = staging.validate_frontmatter(full, skill["raw"])
+        return None if ok else why
 
-    # ── 4. Set up DSPy + GEPA optimizer ─────────────────────────────────
-    console.print(f"\n[bold]Configuring optimizer[/bold]")
-    console.print(f"  Optimizer: GEPA ({iterations} iterations)")
-    console.print(f"  Optimizer model: {optimizer_model}")
-    console.print(f"  Eval model: {eval_model}")
-
-    # Global default LM — GEPA uses dspy.settings.lm for student evaluation
-    configure_default_lm("eval", override=eval_model, temperature=0.0)
-    lm = get_lm_for_role("eval", override=eval_model, temperature=0.0)
-
-    # Create the baseline skill module
-    baseline_module = SkillModule(skill["body"])
-
-    # Prepare DSPy examples
-    trainset = dataset.to_dspy_examples("train")
-    valset = dataset.to_dspy_examples("val")
-
-    # ── 5. Run GEPA optimization ────────────────────────────────────────
-    console.print(f"\n[bold cyan]Running GEPA optimization ({iterations} iterations)...[/bold cyan]\n")
-
-    start_time = time.time()
-
-    try:
-        reflection_lm = get_lm_for_role("optimizer", override=optimizer_model)
-        optimizer = dspy.GEPA(
-            metric=skill_fitness_metric,
-            max_full_evals=iterations,
-            reflection_lm=reflection_lm,
-        )
-
-        optimized_module = optimizer.compile(
-            baseline_module,
-            trainset=trainset,
-            valset=valset,
-        )
-    except Exception as e:
-        # Fall back to MIPROv2 if GEPA isn't available in this DSPy version
-        console.print(f"[yellow]GEPA not available ({e}), falling back to MIPROv2[/yellow]")
-        optimizer = dspy.MIPROv2(
-            metric=skill_fitness_metric,
-            auto="light",
-        )
-        optimized_module = optimizer.compile(
-            baseline_module,
-            trainset=trainset,
-        )
-
-    elapsed = time.time() - start_time
-    console.print(f"\n  Optimization completed in {elapsed:.1f}s")
-
-    # ── 6. Extract evolved skill text ───────────────────────────────────
-    # The optimized module's instructions contain the evolved skill text
-    evolved_body = optimized_module.skill_text
-    evolved_full = reassemble_skill(skill["frontmatter"], evolved_body)
-
-    # ── 7. Validate evolved skill ───────────────────────────────────────
-    console.print(f"\n[bold]Validating evolved skill[/bold]")
-    evolved_constraints = validator.validate_all(evolved_full, "skill", baseline_text=skill["raw"])
-    all_pass = True
-    for c in evolved_constraints:
-        icon = "✓" if c.passed else "✗"
-        color = "green" if c.passed else "red"
-        console.print(f"  [{color}]{icon} {c.constraint_name}[/{color}]: {c.message}")
-        if not c.passed:
-            all_pass = False
-
-    if not all_pass:
-        console.print("[red]✗ Evolved skill FAILED constraints — not deploying[/red]")
-        # Still save for inspection/recovery. Use a timestamp so failures don't overwrite each other.
-        failed_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        output_path = Path("output") / skill_name / f"evolved_FAILED_{failed_timestamp}.md"
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        output_path.write_text(evolved_full)
-        # Backward-compatible latest failure pointer.
-        latest_failed_path = Path("output") / skill_name / "evolved_FAILED.md"
-        latest_failed_path.write_text(evolved_full)
-        console.print(f"  Saved failed variant to {output_path}")
-        console.print(f"  Latest failed variant also saved to {latest_failed_path}")
-        return
-
-    # ── 8. Evaluate on holdout set ──────────────────────────────────────
-    console.print(f"\n[bold]Evaluating on holdout set ({len(dataset.holdout)} examples)[/bold]")
-
-    holdout_examples = dataset.to_dspy_examples("holdout")
-
-    baseline_scores = []
-    evolved_scores = []
-    for ex in holdout_examples:
-        # Score baseline
-        with dspy.context(lm=get_lm_for_role("eval", override=eval_model, temperature=0.0)):
-            baseline_pred = baseline_module(task_input=ex.task_input)
-            baseline_score = skill_fitness_metric(ex, baseline_pred)
-            baseline_scores.append(baseline_score)
-
-            evolved_pred = optimized_module(task_input=ex.task_input)
-            evolved_score = skill_fitness_metric(ex, evolved_pred)
-            evolved_scores.append(evolved_score)
-
-    avg_baseline = sum(baseline_scores) / max(1, len(baseline_scores))
-    avg_evolved = sum(evolved_scores) / max(1, len(evolved_scores))
-    improvement = avg_evolved - avg_baseline
-
-    # ── 9a. Regression gate ─────────────────────────────────────────
-    passed_gate = check_regression(
-        improvement=improvement,
-        baseline_score=avg_baseline,
-        evolved_score=avg_evolved,
-        artifact_type="skill",
-        artifact_name=skill_name,
+    console.print(f"\n[bold cyan]Propose → Probe → Compose (K={k})[/bold cyan]")
+    result = propose_probe_compose(
+        baseline_body=skill["body"], train=train, val=val, holdout=holdout,
+        agent_chat=agent, optimizer_chat=optimizer, judge=judge, budget=budget, k=k,
+        kind="skill", lessons=lessons, failure_context=failure_ctx,
+        max_growth=0.3, min_effect=min_effect, min_pairs=8, seed=seed,
+        noise_agent_chat=noise_agent if noise_check else None,
+        validate=_validate, log=lambda s: console.print(s),
     )
+    gate = result.gate
+    st = summarize(result.holdout_results)
+    elapsed = time.time() - start
 
-    # ── 9. Report results ───────────────────────────────────────────────
-    table = Table(title="Evolution Results")
-    table.add_column("Metric", style="bold")
-    table.add_column("Baseline", justify="right")
-    table.add_column("Evolved", justify="right")
-    table.add_column("Change", justify="right")
+    console.print(f"\n[bold]Holdout pairwise[/bold]: n={gate.n_pairs} W{st.wins}/T{st.ties}/L{st.losses} "
+                  f"(order-inconsistent={st.order_inconsistent}, judge failures={st.judge_failures})")
+    console.print(f"  mean win score={gate.mean:.3f}  95% CI=[{gate.ci_low:.3f}, {gate.ci_high:.3f}]  "
+                  f"p={gate.p_value:.4f}  decision={gate.decision.upper()}")
+    if gate.reasons:
+        console.print(f"  reasons: {'; '.join(gate.reasons)}")
+    if result.noise:
+        console.print(f"  noise check (baseline vs baseline, n={result.noise['n']}): "
+                      f"mean={result.noise['mean']:.3f} CI=[{result.noise['ci_low']:.3f}, {result.noise['ci_high']:.3f}]")
+    console.print(f"  LLM calls: {budget.used}/{budget.max_calls} {budget.by_role}")
 
-    change_color = "green" if improvement > 0 else "red"
-    table.add_row(
-        "Holdout Score",
-        f"{avg_baseline:.3f}",
-        f"{avg_evolved:.3f}",
-        f"[{change_color}]{improvement:+.3f}[/{change_color}]",
-    )
-    table.add_row(
-        "Skill Size",
-        f"{len(skill['body']):,} chars",
-        f"{len(evolved_body):,} chars",
-        f"{len(evolved_body) - len(skill['body']):+,} chars",
-    )
-    table.add_row("Time", "", f"{elapsed:.1f}s", "")
-    table.add_row("Iterations", "", str(iterations), "")
-
-    console.print()
-    console.print(table)
-
-    # ── 10. Save output ─────────────────────────────────────────────────
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    output_dir = Path("output") / skill_name / timestamp
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    # Save evolved skill
-    (output_dir / "evolved_skill.md").write_text(evolved_full)
-
-    # Save baseline for comparison
-    (output_dir / "baseline_skill.md").write_text(skill["raw"])
-
-    # Save metrics
-    metrics = {
-        "skill_name": skill_name,
-        "timestamp": timestamp,
-        "iterations": iterations,
-        "optimizer_model": optimizer_model,
-        "eval_model": eval_model,
-        "baseline_score": avg_baseline,
-        "evolved_score": avg_evolved,
-        "improvement": improvement,
-        "baseline_size": len(skill["body"]),
-        "evolved_size": len(evolved_body),
-        "train_examples": len(dataset.train),
-        "val_examples": len(dataset.val),
-        "holdout_examples": len(dataset.holdout),
-        "elapsed_seconds": elapsed,
-        "constraints_passed": all_pass,
+    improvement = gate.improvement
+    staged_path = None
+    promoted = False
+    stats = gate.to_dict() | {
+        "decision": gate.decision,
+        "wins": st.wins, "ties": st.ties, "losses": st.losses,
+        "order_inconsistent": st.order_inconsistent, "judge_failures": st.judge_failures,
+        "llm_calls": budget.summary(), "elapsed_seconds": elapsed,
+        "winner": result.winner.name if result.winner else None,
+        "candidates": [{"name": c.name, "probe_score": c.probe_score, "error": c.error}
+                       for c in result.candidates]
+                      + ([{"name": result.composite.name, "probe_score": result.composite.probe_score,
+                           "error": result.composite.error}] if result.composite else []),
+        "notes": result.notes,
     }
-    (output_dir / "metrics.json").write_text(json.dumps(metrics, indent=2))
+    if result.winner is not None:
+        evolved_full = reassemble_skill(skill["frontmatter"], result.winner.body)
+        metrics = {"timestamp": datetime.now().isoformat(), "skill_name": skill_name,
+                   "baseline_score": 0.5, "evolved_score": gate.mean, "improvement": improvement,
+                   **{k_: stats[k_] for k_ in ("decision", "ci_low", "ci_high", "p_value", "n_pairs")}}
+        manifest = staging.finalize(
+            skill_name, "skill", skill_path, evolved_full, stats,
+            apply=apply, force_promote=promote,
+            extra_files={"baseline_skill.md": skill["raw"], "metrics.json": metrics,
+                         "holdout_pairs.json": [vars(r) for r in result.holdout_results]})
+        staged_path = manifest["staged_path"]
+        promoted = manifest.get("status") == "promoted"
+        console.print(f"\n  staged → {staged_path}")
+        console.print(f"  manifest → {staging.manifest_path(skill_name)}")
+        if manifest.get("promotion_error"):
+            console.print(f"[red]  promotion aborted: {manifest['promotion_error']}[/red]")
+        elif promoted:
+            console.print(f"[bold green]  ✓ promoted to {skill_path} (backup {manifest.get('backup_path')})[/bold green]")
+            console.print(f"    rollback: python -m evolution.core.staging rollback --artifact {skill_name}")
+        if gate.decision == "promote":
+            record_lesson(skill_name, cue=skill_name,
+                          lesson=f"Skill '{skill_name}' improved via {result.winner.name}: "
+                                 f"{result.winner.strategy[:200]}",
+                          evidence=f"holdout pairwise mean={gate.mean:.3f} CI=[{gate.ci_low:.3f},"
+                                   f"{gate.ci_high:.3f}] n={gate.n_pairs} p={gate.p_value:.4f}")
 
-    console.print(f"\n  Output saved to {output_dir}/")
-
-    if passed_gate:
-        console.print(f"\n[bold green]✓ Evolution improved skill by {improvement:+.3f} ({improvement/max(0.001, avg_baseline)*100:+.1f}%)[/bold green]")
-        console.print(f"  Review the diff: diff {output_dir}/baseline_skill.md {output_dir}/evolved_skill.md")
-        if apply:
-            skill_path.write_text(evolved_full)
-            console.print(f"\n[bold green]✓ Applied evolved skill → {skill_path}[/bold green]")
-        else:
-            console.print(f"  To apply: cp {output_dir}/evolved_skill.md {skill_path}")
+    if improvement > 0 and gate.decision != "reject":
+        console.print(f"\n[bold green]✓ Evolution improved skill by {improvement:+.3f} (pairwise win score "
+                      f"{gate.mean:.3f}); decision={gate.decision}[/bold green]")
     else:
         console.print(f"\n[yellow]⚠ Evolution did not improve skill (change: {improvement:+.3f})[/yellow]")
-        console.print("  Try: more iterations, better eval dataset, or different optimizer model")
+
+    res = dict(success=True, improvement=improvement, ci_low=gate.ci_low, ci_high=gate.ci_high,
+               p_value=gate.p_value, decision=gate.decision, staged_path=staged_path,
+               n_pairs=gate.n_pairs, promoted=promoted, llm_calls=budget.used,
+               noise=result.noise)
+    _emit(res)
+    return res
 
 
 @click.command()
 @click.option("--skill", required=True, help="Name of the skill to evolve")
-@click.option("--iterations", default=10, help="Number of GEPA iterations")
-@click.option("--eval-source", default="synthetic", type=click.Choice(["synthetic", "golden", "sessiondb"]),
-              help="Source for evaluation dataset")
-@click.option("--dataset-path", default=None, help="Path to existing eval dataset (JSONL)")
-@click.option("--optimizer-model", default=None, help="Model for GEPA reflections (default: provider default via HERMES_LLM_PROVIDER)")
-@click.option("--eval-model", default=None, help="Model for evaluations (default: provider default via HERMES_LLM_PROVIDER)")
-@click.option("--hermes-repo", default=None, help="Path to hermes-agent repo")
-@click.option("--run-tests", is_flag=True, help="Run full pytest suite as constraint gate")
-@click.option("--dry-run", is_flag=True, help="Validate setup without running optimization")
-@click.option("--apply", is_flag=True, help="Write evolved skill back to its source SKILL.md if improvement > 0")
-def main(skill, iterations, eval_source, dataset_path, optimizer_model, eval_model, hermes_repo, run_tests, dry_run, apply):
-    """Evolve a Hermes Agent skill using DSPy + GEPA optimization."""
-    evolve(
-        skill_name=skill,
-        iterations=iterations,
-        eval_source=eval_source,
-        dataset_path=dataset_path,
-        optimizer_model=optimizer_model,
-        eval_model=eval_model,
-        hermes_repo=hermes_repo,
-        run_tests=run_tests,
-        dry_run=dry_run,
-        apply=apply,
-    )
+@click.option("--iterations", default=10, help="Search effort hint (bounds proposals); budget is --max-calls")
+@click.option("--eval-source", default="synthetic", type=click.Choice(EVAL_SOURCES))
+@click.option("--dataset-path", default=None, help="Path to existing eval dataset dir (JSONL splits)")
+@click.option("--optimizer-model", default=None)
+@click.option("--eval-model", default=None)
+@click.option("--hermes-repo", default=None)
+@click.option("--run-tests", is_flag=True)
+@click.option("--dry-run", is_flag=True)
+@click.option("--apply", is_flag=True, help="Promote to live ONLY if the stats gate says 'promote'")
+@click.option("--candidates", default=3, show_default=True, help="K candidate proposals")
+@click.option("--stage-only", is_flag=True, default=False, help="Default behaviour: stage, never write live")
+@click.option("--promote", "force_promote", is_flag=True, help="Explicitly promote the staged winner")
+@click.option("--min-effect", default=0.05, show_default=True)
+@click.option("--repeats", default=2, show_default=True, help="Judge orders per pair (>=2 runs both)")
+@click.option("--max-calls", default=400, show_default=True)
+@click.option("--seed", default=0, show_default=True)
+@click.option("--no-noise-check", is_flag=True)
+def main(skill, iterations, eval_source, dataset_path, optimizer_model, eval_model, hermes_repo,
+         run_tests, dry_run, apply, candidates, stage_only, force_promote, min_effect, repeats,
+         max_calls, seed, no_noise_check):
+    if stage_only:
+        apply, force_promote = False, False
+    try:
+        evolve(skill_name=skill, iterations=iterations, eval_source=eval_source,
+               dataset_path=dataset_path, optimizer_model=optimizer_model, eval_model=eval_model,
+               hermes_repo=hermes_repo, run_tests=run_tests, dry_run=dry_run, apply=apply,
+               candidates=candidates, promote=force_promote, min_effect=min_effect,
+               repeats=repeats, max_calls=max_calls, seed=seed, noise_check=not no_noise_check)
+    except (SystemExit, click.UsageError):
+        raise
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        _emit(dict(success=False, improvement=0.0, ci_low=None, ci_high=None, p_value=None,
+                   decision="reject", staged_path=None, n_pairs=0, error=str(e)))
+        sys.exit(2)
 
 
 if __name__ == "__main__":

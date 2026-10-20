@@ -39,7 +39,7 @@ class TestGrowthConstraints:
 
     def test_excessive_growth(self, validator):
         baseline = "x" * 1000
-        evolved = "x" * 1300  # 30% growth
+        evolved = "x" * 3100  # 210% growth - exceeds 200% limit (max_prompt_growth=2.0)
         result = validator._check_growth(evolved, baseline, "skill")
         assert not result.passed
 

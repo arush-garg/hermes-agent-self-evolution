@@ -101,57 +101,22 @@ class TestLoadPastMetrics:
 
 
 class TestSelectSkillViaHermes:
-    def test_dry_run_returns_valid_skill(self):
-        skills = ["arxiv", "github-code-review", "systematic-debugging"]
-        past = {"github-code-review": {"evolved_score": 0.8, "baseline_score": 0.7, "improvement": 0.1}}
+    def test_failure_signal_outweighs_prior_metrics(self):
+        from unittest.mock import patch
+        with patch('evolution.core.failure_mining.mine', return_value=[{'artifact':'b','score':10}]):
+            assert select_skill_via_hermes(['a','b'], {'a': {'evolved_score':0.1}}, set()) == 'b'
 
-        result = select_skill_via_hermes(skills, past, dry_run=True)
-        assert result in skills
+    def test_cooldown_without_new_failures(self):
+        with patch('evolution.core.failure_mining.mine', return_value=[]):
+            assert select_skill_via_hermes(['a','b'], {}, {'a'}) == 'b'
 
-    def test_dry_run_with_no_past_metrics_returns_first(self):
-        skills = ["arxiv", "github-code-review"]
-        result = select_skill_via_hermes(skills, {}, dry_run=True)
-        assert result in skills
+    def test_cooldown_override_by_failure(self):
+        with patch('evolution.core.failure_mining.mine', return_value=[{'artifact':'a','score':3}]):
+            assert select_skill_via_hermes(['a','b'], {}, {'a'}) == 'a'
 
-    def test_dry_run_prefers_lowest_scored_skill(self):
-        skills = ["a", "b", "c"]
-        past = {
-            "a": {"evolved_score": 0.9, "baseline_score": 0.8, "improvement": 0.1, "timestamp": "t"},
-            "b": {"evolved_score": 0.3, "baseline_score": 0.4, "improvement": -0.1, "timestamp": "t"},
-        }
-        result = select_skill_via_hermes(skills, past, dry_run=True)
-        assert result == "b"  # lowest evolved_score
-
-    def test_raises_when_no_skills(self):
+    def test_empty_candidates(self):
         with pytest.raises(ValueError):
             select_skill_via_hermes([], {})
-
-    def test_fuzzy_fallback_when_hermes_returns_unknown(self):
-        skills = ["github-code-review", "systematic-debugging"]
-        past = {}
-
-        with patch("subprocess.run") as mock_run:
-            mock_run.return_value = MagicMock(
-                returncode=0,
-                stdout="I recommend github-code-review skill\n",
-            )
-            result = select_skill_via_hermes(skills, past)
-            assert result == "github-code-review"
-
-    def test_hard_fallback_when_hermes_returns_garbage(self):
-        skills = ["github-code-review", "systematic-debugging"]
-        past = {
-            "github-code-review": {"evolved_score": 0.5, "baseline_score": 0.4,
-                                    "improvement": 0.1, "timestamp": "t"},
-            "systematic-debugging": {"evolved_score": 0.3, "baseline_score": 0.4,
-                                      "improvement": -0.1, "timestamp": "t"},
-        }
-
-        with patch("subprocess.run") as mock_run:
-            mock_run.return_value = MagicMock(returncode=0, stdout="COMPLETELY_UNKNOWN_SKILL\n")
-            result = select_skill_via_hermes(skills, past)
-            # Falls back to lowest evolved_score
-            assert result == "systematic-debugging"
 
 
 class TestWriteLogEntry:
@@ -161,13 +126,13 @@ class TestWriteLogEntry:
         original_repo = runner_module.REPO_ROOT
         try:
             runner_module.REPO_ROOT = tmp_path
-            write_log_entry("test-skill", True, 0.15)
+            write_log_entry("skills", "test-skill", True, 0.15)
 
-            log_file = tmp_path / "logs" / "daily_evolution.log"
+            log_file = tmp_path / "logs" / "daily_evolution.jsonl"
             assert log_file.exists()
 
             entry = json.loads(log_file.read_text().strip())
-            assert entry["skill"] == "test-skill"
+            assert entry["artifact"] == "test-skill"
             assert entry["success"] is True
             assert entry["improvement"] == 0.15
         finally:
@@ -179,10 +144,10 @@ class TestWriteLogEntry:
         original_repo = runner_module.REPO_ROOT
         try:
             runner_module.REPO_ROOT = tmp_path
-            write_log_entry("skill-a", True, 0.1)
-            write_log_entry("skill-b", False, None)
+            write_log_entry("skills", "skill-a", True, 0.1)
+            write_log_entry("skills", "skill-b", False, None)
 
-            log_file = tmp_path / "logs" / "daily_evolution.log"
+            log_file = tmp_path / "logs" / "daily_evolution.jsonl"
             lines = [l for l in log_file.read_text().strip().split("\n") if l]
             assert len(lines) == 2
         finally:

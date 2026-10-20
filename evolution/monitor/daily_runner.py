@@ -127,100 +127,39 @@ def load_past_metrics() -> dict:
 def select_skill_via_hermes(
     skills: list[str],
     past_metrics: dict,
-    recently_evolved: set,
+    recently_evolved: Optional[set] = None,
     stale_skills: Optional[dict] = None,
     dry_run: bool = False,
 ) -> Optional[str]:
-    """Ask the Hermes agent CLI to pick the skill most in need of refinement."""
-    _MAX_CANDIDATES = 30  # keep prompt small enough to fit in 300s window
-    candidates = [s for s in skills if s not in recently_evolved]
-    if not candidates:
-        candidates = skills  # fall back to full list
+    """Deterministically rank failure evidence, staleness, and past metrics.
 
-    # Filter out stale skills (consecutive no-improvement evolutions)
-    stale_skills = stale_skills or {}
-    fresh_candidates = []
-    for s in candidates:
-        count = stale_skills.get(f"skills/{s}", 0)
-        if count >= STALE_THRESHOLD:
-            print(f"  Skipping {s} — stale ({count} consecutive no-improvement)")
-        else:
-            fresh_candidates.append(s)
-    if fresh_candidates:
-        candidates = fresh_candidates
-
-    # Prioritise: never-evolved first, then worst past score
-    if past_metrics:
-        def _priority(s: str) -> tuple:
-            if s not in past_metrics:
-                return (0, "")  # never evolved = highest priority
-            score = past_metrics[s].get("evolved_score") or 1.0
-            return (1, score)  # lower score = higher priority within tier
-        candidates.sort(key=_priority)
-    else:
-        candidates.sort()
-
-    # Cap to avoid hermes CLI timeout with 100+ skill names
-    if len(candidates) > _MAX_CANDIDATES:
-        omitted = len(candidates) - _MAX_CANDIDATES
-        prev = len(candidates)
-        candidates = candidates[:_MAX_CANDIDATES]
-        print(f"  Hermes candidate pool: {prev} → {_MAX_CANDIDATES} (omitted {omitted} lowest-priority)", file=sys.stderr)
-
-    prompt = (
-        "Select the Hermes skill most needing refinement. "
-        "Prioritize: no past evolutions, low scores, or stale improvement.\n\n"
-        f"Past runs (baseline->evolved, improvement, date):\n{json.dumps(past_metrics, indent=2)}\n\n"
-        f"Available skills: {', '.join(candidates)}\n\n"
-        "Before deciding, review Hermes' own sessions and recent Claude Code transcripts to inform your choice. "
-        "Make some tool calls if needed — e.g. session_search, read_file, or search_files — to gather evidence.\n\n"
-        "Reply with ONLY the exact skill name, nothing else."
-    )
-
-    if dry_run:
-        print(f"\n[dry-run] Hermes prompt for skill selection:\n---\n{prompt}\n---")
-        if past_metrics:
-            return min(past_metrics, key=lambda k: past_metrics[k].get("evolved_score") or 1.0)
-        return candidates[0] if candidates else None
-
-    # Resolve hermes CLI
-    hermes_bin = shutil.which("hermes")
-    if not hermes_bin:
-        explicit = Path.home() / ".local" / "bin" / "hermes"
-        if explicit.exists():
-            hermes_bin = str(explicit)
-
-    if not hermes_bin:
-        print("[warn] hermes CLI not found in PATH or ~/.local/bin. Falling back to lowest-scored skill.", file=sys.stderr)
-        if past_metrics:
-            return min(past_metrics, key=lambda k: past_metrics[k].get("evolved_score") or 1.0)
-        return candidates[0] if candidates else None
-
-    result = subprocess.run(
-        [hermes_bin, "-z", prompt],
-        capture_output=True,
-        text=True,
-        timeout=600,
-    )
-    raw = result.stdout.strip()
-    if result.returncode != 0:
-        print(f"[warn] hermes CLI exited with code {result.returncode}", file=sys.stderr)
-        if result.stderr:
-            print(f"  stderr: {result.stderr[:300]}", file=sys.stderr)
-
-    lines = [ln.strip() for ln in raw.splitlines() if ln.strip()]
-    selected = lines[-1] if lines else ""
-
-    selected_norm = selected.strip().lower()
-    for s in candidates:
-        if s.strip().lower() == selected_norm:
-            return s
-
-    print(f"[warn] Hermes returned '{selected}' which is not a known skill. Falling back.", file=sys.stderr)
-    if past_metrics:
-        return min(past_metrics, key=lambda k: past_metrics[k].get("evolved_score") or 1.0)
-    return candidates[0] if candidates else None
-
+    Seven-day cooldown applies unless new failure evidence exists.
+    """
+    if not skills:
+        raise ValueError('No skills available')
+    from evolution.core.failure_mining import mine
+    failures = {row['artifact']: row for row in mine(days=30)}
+    recently_evolved = recently_evolved or set()
+    now = datetime.now()
+    last_runs = {}
+    log = REPO_ROOT / 'logs/daily_evolution.jsonl'
+    if log.exists():
+        for line in log.read_text(errors='replace').splitlines()[-2000:]:
+            try:
+                row = json.loads(line)
+                if row.get('pipeline') == 'skills' and row.get('artifact'):
+                    last_runs[row['artifact']] = datetime.fromisoformat(row['timestamp'].replace('Z', '+00:00')).replace(tzinfo=None)
+            except (ValueError, KeyError, TypeError):
+                continue
+    def rank(name):
+        metric = past_metrics.get(name, {})
+        failure = failures.get(name, {})
+        return (failure.get('score', 0) * 10 + (1 - (metric.get('evolved_score') or 0.5)) * 3
+                + (stale_skills or {}).get(f'skills/{name}', 0), name)
+    eligible = [s for s in skills if (s not in recently_evolved and
+                (s not in last_runs or (now - last_runs[s]).days >= 7)) or
+                failures.get(s, {}).get('score', 0) > 0]
+    return sorted(eligible or skills, key=lambda name: (-rank(name)[0], rank(name)[1]))[0]
 
 def select_prompt_section(state: dict) -> str:
     """Rotate through evolvable prompt sections."""
@@ -276,7 +215,8 @@ def build_command(pipeline: str, artifact: str) -> list[str]:
     python = sys.executable
     if pipeline == "skills":
         return [python, "-m", "evolution.skills.evolve_skill",
-                "--skill", artifact, "--iterations", "10", "--apply"]
+                "--skill", artifact, "--iterations", "10", "--eval-source", "mixed",
+                "--candidates", "3", "--repeats", "2", "--apply"]
     elif pipeline == "tools":
         return [python, "-m", "evolution.tools.evolve_tool_descriptions",
                 "--iterations", "5"]
@@ -303,14 +243,18 @@ def run_evolution(pipeline: str, artifact: str) -> tuple[bool, Optional[float]]:
 
         env = os.environ.copy()
         env.setdefault("HERMES_LLM_PROVIDER", "omniroute")
+        from evolution.core.failure_mining import mine
+        context_path = logs_dir / 'failure_context.json'
+        context_path.write_text(json.dumps(mine(days=30)[:30], indent=2))
+        env['EVOLUTION_FAILURE_CONTEXT'] = str(context_path)
 
-        result = subprocess.run(
-            cmd,
-            cwd=str(REPO_ROOT),
-            stdout=log_f,
-            stderr=subprocess.STDOUT,
-            env=env,
-        )
+        try:
+            result = subprocess.run(cmd, cwd=str(REPO_ROOT), stdout=log_f,
+                                    stderr=subprocess.STDOUT, env=env, timeout=3 * 3600)
+        except subprocess.TimeoutExpired:
+            log_f.write('\nEvolution wall-clock limit (3h) exceeded.\n')
+            print(f'  Evolution timed out — full log: {log_path}', file=sys.stderr)
+            return False, None
 
     # Latest-log symlink
     latest_link = logs_dir / f"evolve_{pipeline}_latest.log"
@@ -318,6 +262,15 @@ def run_evolution(pipeline: str, artifact: str) -> tuple[bool, Optional[float]]:
         latest_link.unlink()
     latest_link.symlink_to(log_path.name)
 
+    # Structured result is authoritative when available; older pipelines use metrics fallback.
+    for line in reversed(log_path.read_text(errors='replace').splitlines()):
+        if line.startswith('EVOLUTION_RESULT '):
+            try:
+                data = json.loads(line.removeprefix('EVOLUTION_RESULT '))
+                globals()['_LAST_EVOLUTION_RESULT'] = data
+                return bool(data.get('success')), data.get('improvement')
+            except (ValueError, TypeError):
+                break
     if result.returncode != 0:
         print(f"  Evolution failed — full log: {log_path}", file=sys.stderr)
         return False, None
@@ -434,6 +387,10 @@ def write_log_entry(pipeline: str, artifact: str, success: bool, improvement: Op
         "artifact": artifact,
         "success": success,
         "improvement": improvement,
+        "decision": globals().get('_LAST_EVOLUTION_RESULT', {}).get('decision'),
+        "ci_low": globals().get('_LAST_EVOLUTION_RESULT', {}).get('ci_low'),
+        "ci_high": globals().get('_LAST_EVOLUTION_RESULT', {}).get('ci_high'),
+        "n_pairs": globals().get('_LAST_EVOLUTION_RESULT', {}).get('n_pairs'),
     }
     log_file = logs_dir / "daily_evolution.jsonl"
     with log_file.open("a") as f:
@@ -464,6 +421,9 @@ def main() -> None:
     args = parser.parse_args()
 
     ts = datetime.now().strftime("%Y-%m-%d_%H%M%S")
+    from evolution.core.housekeeping import housekeeping
+    usage = housekeeping(REPO_ROOT, dry_run=args.dry_run)
+    print(f"Housekeeping (bytes): {usage['before']} -> {usage['after']}")
     logs_dir = REPO_ROOT / "logs"
     logs_dir.mkdir(exist_ok=True)
 
@@ -551,9 +511,17 @@ def _main(args) -> None:
     if dry_run:
         cmd = build_command(pipeline_type, artifact)
         print(f"\n[dry-run] Would run:\n  {' '.join(cmd)}")
+        from evolution.core.failure_mining import mine
+        print(f"[dry-run] Failure context: {json.dumps(mine(days=30)[:3])}")
+        from evolution.core.housekeeping import housekeeping
+        print(f"[dry-run] Housekeeping plan: {json.dumps(housekeeping(REPO_ROOT, dry_run=True)['plan'])}")
         return
 
     # ── Run ────────────────────────────────────────────────────────────
+    globals()['_LAST_EVOLUTION_RESULT'] = {}
+    if pipeline_type == 'code' and select_code_tool(state) is None:
+        print('  Code prerequisites missing; skipping cleanly.')
+        return
     print("  Running evolution...")
     success, improvement = run_evolution(pipeline_type, artifact)
 

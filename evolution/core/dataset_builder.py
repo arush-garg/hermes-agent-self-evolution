@@ -7,6 +7,7 @@ C) Golden sets — hand-curated JSONL files
 """
 
 import json
+import sys
 import random
 from pathlib import Path
 from dataclasses import dataclass, field
@@ -26,6 +27,11 @@ class EvalExample:
     difficulty: str = "medium"  # easy, medium, hard
     category: str = "general"  # Category for stratified eval
     source: str = "synthetic"  # synthetic, sessiondb, golden
+    task_class: str = "general"
+    session_id: str = ""
+    tool_trace_summary: str = ""
+    outcome: str = "unknown"
+    failure_signals: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict:
         return {
@@ -34,6 +40,11 @@ class EvalExample:
             "difficulty": self.difficulty,
             "category": self.category,
             "source": self.source,
+            "task_class": self.task_class,
+            "session_id": self.session_id,
+            "tool_trace_summary": self.tool_trace_summary[:1500],
+            "outcome": self.outcome,
+            "failure_signals": self.failure_signals,
         }
 
     @classmethod
@@ -222,8 +233,11 @@ class SyntheticDatasetBuilder:
                         return text[start : idx + 1]
             return None
 
+        def _safe_parse(raw):
+            return json.loads(raw)
+
         try:
-            cases_raw = json.loads(result.test_cases)
+            cases_raw = _safe_parse(result.test_cases)
         except json.JSONDecodeError:
             # Strip markdown code fences if present.
             import re
@@ -234,25 +248,33 @@ class SyntheticDatasetBuilder:
                 try:
                     cases_raw = json.loads(fence_match.group(1))
                 except json.JSONDecodeError:
-                    # Fallback to balanced‑bracket extraction on the captured group.
                     raw = _extract_balanced_array(fence_match.group(1))
-                    if raw:
-                        cases_raw = json.loads(raw)
-                    else:
-                        raise
+                    try:
+                        cases_raw = json.loads(raw) if raw else []
+                    except json.JSONDecodeError:
+                        cases_raw = []
             else:
-                # Try balanced bracket extraction on the whole output.
                 raw = _extract_balanced_array(result.test_cases)
                 if raw:
-                    cases_raw = json.loads(raw)
+                    try:
+                        cases_raw = json.loads(raw)
+                    except json.JSONDecodeError:
+                        cases_raw = []
                 else:
-                    # Last resort: fallback to minimal heuristic-based cases
-                    cases_raw = _fallback_cases(artifact_text, n)
-                    if cases_raw:
-                        print(f"  [warn] LLM output unparseable, using {len(cases_raw)} heuristic fallback cases.", file=sys.stderr)
-                    else:
-                        preview = result.test_cases[:300]
-                        raise ValueError(f"Could not parse test cases from LLM output: {preview}")
+                    cases_raw = []
+            if not cases_raw:
+                decoder = json.JSONDecoder()
+                cases_raw = []
+                for match in re.finditer(r'\{', result.test_cases):
+                    try:
+                        item, _ = decoder.raw_decode(result.test_cases[match.start():])
+                        if isinstance(item, dict) and item.get('task_input') and item.get('expected_behavior'):
+                            cases_raw.append(item)
+                    except json.JSONDecodeError:
+                        continue
+            if not cases_raw:
+                cases_raw = _fallback_cases(artifact_text, n)
+                print(f'  [warn] Truncated/unparseable LLM cases; using {len(cases_raw)} fallback cases.', file=sys.stderr)
 
         examples = [
             EvalExample(
@@ -277,6 +299,39 @@ class SyntheticDatasetBuilder:
             val=examples[n_train:n_train + n_val],
             holdout=examples[n_train + n_val:],
         )
+
+
+def build_mixed_dataset(skill_name: str, skill_text: str, output_path: Path,
+                        config: EvolutionConfig, minimum: int = 12) -> EvalDataset:
+    """Replay real tasks first; top up scarce data with synthetic cases.
+
+    Session boundaries and chronological holdout are preserved. Synthetic cases never
+    reuse a real session id; when real history is sparse, at least 8 holdout cases
+    are allocated for a meaningful regression gate.
+    """
+    from evolution.core.trajectory_replay import replay
+    real = replay(skill_name, limit=100)
+    by_session = {}
+    for example in real:
+        by_session.setdefault(example.session_id, []).append(example)
+    ids = list(by_session)
+    n_hold = max(1, int(len(ids) * .3)) if ids else 0
+    n_val = max(1, int(len(ids) * .2)) if len(ids) > 2 else 0
+    dataset = EvalDataset(
+        train=[e for sid in ids[:len(ids)-n_hold-n_val] for e in by_session[sid]],
+        val=[e for sid in ids[len(ids)-n_hold-n_val:len(ids)-n_hold] for e in by_session[sid]],
+        holdout=[e for sid in ids[len(ids)-n_hold:] for e in by_session[sid]],
+    )
+    needed = max(0, minimum - len(real), 8 - len(dataset.holdout))
+    if needed:
+        synthetic = SyntheticDatasetBuilder(config).generate(skill_text, num_cases=max(needed + 3, 12))
+        extras = synthetic.all_examples
+        while len(dataset.holdout) < 8 and extras:
+            dataset.holdout.append(extras.pop())
+        for i, ex in enumerate(extras[:max(0, minimum-len(dataset.all_examples))]):
+            (dataset.val if i % 3 == 0 else dataset.train).append(ex)
+    dataset.save(output_path)
+    return dataset
 
 
 class GoldenDatasetLoader:

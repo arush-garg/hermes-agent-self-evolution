@@ -954,6 +954,25 @@ def build_dataset_from_external(
     Returns:
         EvalDataset with train/val/holdout splits.
     """
+    if sources == ['hermes'] or sources == ['sessiondb']:
+        from evolution.core.trajectory_replay import replay
+        cases = replay(skill_name, limit=max_examples)
+        # Preserve session boundaries; replay is chronological, so newest sessions form holdout.
+        ordered = cases
+        groups = {}
+        for case in ordered:
+            groups.setdefault(case.session_id, []).append(case)
+        ids = list(groups)
+        n_hold = max(1, int(len(ids) * .3)) if ids else 0
+        n_val = max(1, int(len(ids) * .2)) if len(ids) > 2 else 0
+        hold = ids[-n_hold:] if n_hold else []
+        val = ids[-n_hold-n_val:-n_hold] if n_val else []
+        train = ids[:len(ids)-n_hold-n_val]
+        dataset = EvalDataset(train=[c for sid in train for c in groups[sid]],
+                              val=[c for sid in val for c in groups[sid]],
+                              holdout=[c for sid in hold for c in groups[sid]])
+        dataset.save(output_path)
+        return dataset
     all_messages = []
 
     importers = {

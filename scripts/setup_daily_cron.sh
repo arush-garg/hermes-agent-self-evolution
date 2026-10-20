@@ -31,42 +31,14 @@ else
     exit 1
 fi
 
-# --- Gather API keys from the user's shell environment ---
-CLAUDE_TOKEN=""
-if command -v zsh &>/dev/null; then
-    CLAUDE_TOKEN="$(zsh -i -c 'echo "${CLAUDE_CODE_OAUTH_TOKEN:-}"' 2>/dev/null || true)"
-fi
-
-if [ -z "$CLAUDE_TOKEN" ]; then
-    echo "WARNING: CLAUDE_CODE_OAUTH_TOKEN not found in zsh login shell." >&2
-    echo "  Skill selection via Hermes CLI will fall back to lowest-scored metric." >&2
-    echo "  Set 'export CLAUDE_CODE_OAUTH_TOKEN=...' in your ~/.zshrc and re-run this script." >&2
-else
-    echo "  Found CLAUDE_CODE_OAUTH_TOKEN (${#CLAUDE_TOKEN} chars)"
-fi
-
-mkdir -p "$REPO_DIR/logs"
-
-# Unload existing agent if present
-if launchctl list "$PLIST_LABEL" &>/dev/null; then
-    launchctl unload "$PLIST_PATH" 2>/dev/null || true
-fi
-
-# Build the EnvironmentVariables dict
+mkdir -p "$REPO_DIR/logs" "$HOME/Library/LaunchAgents"
+# Selection is deterministic and needs no Claude token. Do not embed credentials
+# in a world-readable plist or change launchctl state from this setup script.
 EXTRA_ENV="
         <key>PATH</key>
         <string>${HOME}/.local/bin:/usr/local/bin:/usr/bin:/bin</string>
         <key>HOME</key>
-        <string>${HOME}</string>"
-
-if [ -n "$CLAUDE_TOKEN" ]; then
-    EXTRA_ENV="$EXTRA_ENV
-        <key>CLAUDE_CODE_OAUTH_TOKEN</key>
-        <string>${CLAUDE_TOKEN}</string>"
-fi
-
-# Omniroute: route all DSPy/LiteLLM calls through the local proxy
-EXTRA_ENV="$EXTRA_ENV
+        <string>${HOME}</string>
         <key>HERMES_LLM_PROVIDER</key>
         <string>omniroute</string>"
 
@@ -101,22 +73,9 @@ cat > "$PLIST_PATH" <<EOF
 </plist>
 EOF
 
-launchctl load "$PLIST_PATH"
+# Parent operator loads the plist after review.
 
-# Remove any legacy crontab entry from the old setup
-EXISTING_CRON="$(crontab -l 2>/dev/null || true)"
-if echo "$EXISTING_CRON" | grep -q "hermes-skill-evolution-daily"; then
-    echo "$EXISTING_CRON" | grep -v "hermes-skill-evolution-daily" | crontab -
-    echo "Removed legacy crontab entry."
-fi
-
-# Also delete the old daily-only run flag so the gauntlet starts fresh
-STATE_FILE="${REPO_DIR}/logs/evolution_schedule.json"
-if [ -f "$STATE_FILE" ] && [ ! -s "$STATE_FILE" ]; then
-    rm -f "$STATE_FILE"
-fi
-
-echo "LaunchAgent installed: ${PLIST_PATH}"
+echo "LaunchAgent plist written (not loaded): ${PLIST_PATH}"
 echo "  Python:  ${PYTHON}"
 echo "  Module:  evolution.monitor.daily_runner"
 echo "  Interval: every ${INTERVAL}s ($((INTERVAL / 3600))h $(( (INTERVAL % 3600) / 60 ))m)"

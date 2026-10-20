@@ -181,7 +181,7 @@ def _enable_omniroute_proxy() -> None:
     _OMNIROUTE_CONFIGURED = True
 
 
-_DEFAULT_MAX_TOKENS = 4096
+_DEFAULT_MAX_TOKENS = 16384
 
 
 @functools.lru_cache(maxsize=64)
@@ -204,8 +204,8 @@ def get_lm(
     (None) uses the provider default, which is typically ~0.7 for most
     chat models.
 
-    max_tokens defaults to _DEFAULT_MAX_TOKENS (4096) when the env var
-    HERMES_MAX_TOKENS is not set. Set HERMES_MAX_TOKENTS=0 (or pass
+    max_tokens defaults to _DEFAULT_MAX_TOKENS (16384) when the env var
+    HERMES_MAX_TOKENS is not set. Set HERMES_MAX_TOKENS=0 (or pass
     max_tokens=0) to disable; some providers pick their own default then.
     """
     if max_tokens is None:

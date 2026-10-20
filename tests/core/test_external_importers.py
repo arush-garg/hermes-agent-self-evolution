@@ -263,8 +263,10 @@ class TestClaudeCodeImporter:
             + json.dumps({"display": "here is sk-ant-api03-SECRETKEY123456789012345678 the key", "timestamp": 1700000002000, "project": "/test", "sessionId": "abc"}) + "\n"
         )
 
-        with patch.object(ClaudeCodeImporter, "HISTORY_PATH", history):
-            messages = ClaudeCodeImporter.extract_messages()
+        # Must patch both PROJECTS_DIR and HISTORY_PATH since extract_messages checks PROJECTS_DIR first
+        with patch.object(ClaudeCodeImporter, "PROJECTS_DIR", tmp_path / "projects"):
+            with patch.object(ClaudeCodeImporter, "HISTORY_PATH", history):
+                messages = ClaudeCodeImporter.extract_messages()
 
         # 1 valid message (second too short, third has secret)
         assert len(messages) == 1
@@ -273,8 +275,9 @@ class TestClaudeCodeImporter:
         assert messages[0]["project"] == "/test"
 
     def test_handles_missing_file(self, tmp_path):
-        with patch.object(ClaudeCodeImporter, "HISTORY_PATH", tmp_path / "nonexistent.jsonl"):
-            messages = ClaudeCodeImporter.extract_messages()
+        with patch.object(ClaudeCodeImporter, "PROJECTS_DIR", tmp_path / "projects"):
+            with patch.object(ClaudeCodeImporter, "HISTORY_PATH", tmp_path / "nonexistent.jsonl"):
+                messages = ClaudeCodeImporter.extract_messages()
         assert messages == []
 
     def test_respects_limit(self, tmp_path):
@@ -285,8 +288,9 @@ class TestClaudeCodeImporter:
         ]
         history.write_text("\n".join(lines) + "\n")
 
-        with patch.object(ClaudeCodeImporter, "HISTORY_PATH", history):
-            messages = ClaudeCodeImporter.extract_messages(limit=5)
+        with patch.object(ClaudeCodeImporter, "PROJECTS_DIR", tmp_path / "projects"):
+            with patch.object(ClaudeCodeImporter, "HISTORY_PATH", history):
+                messages = ClaudeCodeImporter.extract_messages(limit=5)
 
         assert len(messages) == 5
 
@@ -298,8 +302,9 @@ class TestClaudeCodeImporter:
             + "{broken\n"
         )
 
-        with patch.object(ClaudeCodeImporter, "HISTORY_PATH", history):
-            messages = ClaudeCodeImporter.extract_messages()
+        with patch.object(ClaudeCodeImporter, "PROJECTS_DIR", tmp_path / "projects"):
+            with patch.object(ClaudeCodeImporter, "HISTORY_PATH", history):
+                messages = ClaudeCodeImporter.extract_messages()
 
         assert len(messages) == 1
 
@@ -311,8 +316,9 @@ class TestClaudeCodeImporter:
             + "\n"
         )
 
-        with patch.object(ClaudeCodeImporter, "HISTORY_PATH", history):
-            messages = ClaudeCodeImporter.extract_messages()
+        with patch.object(ClaudeCodeImporter, "PROJECTS_DIR", tmp_path / "projects"):
+            with patch.object(ClaudeCodeImporter, "HISTORY_PATH", history):
+                messages = ClaudeCodeImporter.extract_messages()
 
         assert len(messages) == 1
 
@@ -482,7 +488,7 @@ class TestHermesSessionImporter:
         }
         (tmp_path / "session_001.json").write_text(json.dumps(session))
 
-        with patch.object(HermesSessionImporter, "SESSION_DIR", tmp_path):
+        with patch.object(HermesSessionImporter, "state_db_path", return_value=tmp_path / "absent.db"), patch.object(HermesSessionImporter, "SESSION_DIR", tmp_path):
             msgs = HermesSessionImporter.extract_messages()
 
         assert len(msgs) == 2
@@ -501,7 +507,7 @@ class TestHermesSessionImporter:
         }
         (tmp_path / "s.json").write_text(json.dumps(session))
 
-        with patch.object(HermesSessionImporter, "SESSION_DIR", tmp_path):
+        with patch.object(HermesSessionImporter, "state_db_path", return_value=tmp_path / "absent.db"), patch.object(HermesSessionImporter, "SESSION_DIR", tmp_path):
             msgs = HermesSessionImporter.extract_messages()
         assert len(msgs) == 0
 
@@ -514,19 +520,19 @@ class TestHermesSessionImporter:
         }
         (tmp_path / "s.json").write_text(json.dumps(session))
 
-        with patch.object(HermesSessionImporter, "SESSION_DIR", tmp_path):
+        with patch.object(HermesSessionImporter, "state_db_path", return_value=tmp_path / "absent.db"), patch.object(HermesSessionImporter, "SESSION_DIR", tmp_path):
             msgs = HermesSessionImporter.extract_messages()
         assert len(msgs) == 0
 
     def test_handles_missing_dir(self, tmp_path):
-        with patch.object(HermesSessionImporter, "SESSION_DIR", tmp_path / "nonexistent"):
+        with patch.object(HermesSessionImporter, "state_db_path", return_value=tmp_path / "absent.db"), patch.object(HermesSessionImporter, "SESSION_DIR", tmp_path / "nonexistent"):
             msgs = HermesSessionImporter.extract_messages()
         assert msgs == []
 
     def test_handles_malformed_json(self, tmp_path):
         (tmp_path / "bad.json").write_text("{not valid json")
 
-        with patch.object(HermesSessionImporter, "SESSION_DIR", tmp_path):
+        with patch.object(HermesSessionImporter, "state_db_path", return_value=tmp_path / "absent.db"), patch.object(HermesSessionImporter, "SESSION_DIR", tmp_path):
             msgs = HermesSessionImporter.extract_messages()
         assert msgs == []
 
@@ -538,7 +544,7 @@ class TestHermesSessionImporter:
         }
         (tmp_path / "s.json").write_text(json.dumps(session))
 
-        with patch.object(HermesSessionImporter, "SESSION_DIR", tmp_path):
+        with patch.object(HermesSessionImporter, "state_db_path", return_value=tmp_path / "absent.db"), patch.object(HermesSessionImporter, "SESSION_DIR", tmp_path):
             msgs = HermesSessionImporter.extract_messages()
         assert len(msgs) == 1
         assert msgs[0]["assistant_response"] == ""
@@ -551,7 +557,7 @@ class TestHermesSessionImporter:
         }
         (tmp_path / "s.json").write_text(json.dumps(session))
 
-        with patch.object(HermesSessionImporter, "SESSION_DIR", tmp_path):
+        with patch.object(HermesSessionImporter, "state_db_path", return_value=tmp_path / "absent.db"), patch.object(HermesSessionImporter, "SESSION_DIR", tmp_path):
             msgs = HermesSessionImporter.extract_messages(limit=3)
         assert len(msgs) == 3
 
@@ -1230,4 +1236,4 @@ class TestEvalExampleFormat:
         with open(jsonl_path) as f:
             data = json.loads(f.readline())
 
-        assert set(data.keys()) == {"task_input", "expected_behavior", "difficulty", "category", "source"}
+        assert {"task_input", "expected_behavior", "difficulty", "category", "source"} <= set(data.keys())
