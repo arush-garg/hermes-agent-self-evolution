@@ -207,6 +207,17 @@ def test_exit_code_zero_with_error_text_is_not_failure(tmp_path):
     assert mine(days=None, db_path=path) == []
 
 
+def test_policy_blocks_are_not_skill_failures(tmp_path):
+    path = tmp_path / 'state.db'
+    blocked = json.dumps({'output': '', 'exit_code': -1,
+                          'error': 'BLOCKED: Command flagged as dangerous (rm -rf). User approval required.'})
+    guard = json.dumps({'error': '[harness-guard] blocked identical retry'})
+    make_db(path, [('s0', 1700000000, [('user', 'clean up the build dir', None, None),
+                                         ('assistant', None, None, _skill_call('media')),
+                                         _tool(blocked), _tool(guard)])])
+    assert mine(days=None, db_path=path) == []
+
+
 def test_recurring_real_errors_rank_by_distinct_sessions(tmp_path):
     path = tmp_path / 'state.db'
     fail = json.dumps({'output': 'ERROR: ffmpeg exited with code 8', 'exit_code': 1, 'error': None})

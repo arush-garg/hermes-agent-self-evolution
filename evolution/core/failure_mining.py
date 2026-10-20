@@ -38,6 +38,10 @@ def _bound(row, limit=MAX_CONTEXT_CHARS):
     return row
 
 
+# Harness approval/guard refusals are policy outcomes, not skill defects.
+_POLICY_BLOCK = re.compile(r'(?i)BLOCKED:|flagged as dangerous|\[harness-guard\]|approval (?:denied|required)')
+
+
 def mine(days=30, db_path=None):
     data = defaultdict(lambda: {'fail_sessions': set(), 'corr_sessions': set(),
                                 'sigs': defaultdict(set), 'tools': {}, 'corrections': []})
@@ -53,7 +57,7 @@ def mine(days=30, db_path=None):
                 continue
             if m['role'] == 'tool':
                 sig = tool_failure(m['content'])
-                if not sig:
+                if not sig or _POLICY_BLOCK.search(sig):
                     continue
                 tool = m.get('tool_name') or 'unknown'
                 key = (tool, _NORM.sub('#', sig.lower())[:120])
