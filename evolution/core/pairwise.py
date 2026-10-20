@@ -104,11 +104,36 @@ class LLMClient:
         self._lm = None
         self._fallback_lm = None
 
-    def _make(self, model: str):
+    def _make(self, model: str, temperature="__default__"):
         import dspy
 
-        return dspy.LM(model, temperature=self.temperature, max_tokens=self.max_tokens,
-                       cache=self.cache, num_retries=2)
+        temp = self.temperature if temperature == "__default__" else temperature
+        kwargs = dict(max_tokens=self.max_tokens, cache=self.cache, num_retries=2)
+        if temp is not None:
+            kwargs["temperature"] = temp
+        return dspy.LM(model, **kwargs)
+
+    @staticmethod
+    def _is_temperature_rejection(e: Exception) -> bool:
+        s = str(e).lower()
+        return "temperature" in s and ("deprecated" in s or "not supported" in s or "unsupported" in s)
+
+    def _call(self, which: str, model: str, messages):
+        lm = getattr(self, which)
+        if lm is None:
+            lm = self._make(model)
+            setattr(self, which, lm)
+        try:
+            return _extract_text(lm(messages=messages))
+        except Exception as e:
+            # Some combo members (e.g. claude-sonnet-5-5) reject any `temperature`; the
+            # combo then falls through to slow members and 504s. Retry once without it.
+            if self.temperature is not None and self._is_temperature_rejection(e):
+                logger.warning("%s model %s rejects temperature; retrying without it", self.role, model)
+                lm = self._make(model, temperature=None)
+                setattr(self, which, lm)
+                return _extract_text(lm(messages=messages))
+            raise
 
     def chat(self, user: str, system: Optional[str] = None) -> str:
         messages = []
@@ -116,10 +141,8 @@ class LLMClient:
             messages.append({"role": "system", "content": system})
         messages.append({"role": "user", "content": user})
         self.budget.spend(self.role)
-        if self._lm is None:
-            self._lm = self._make(self.model)
         try:
-            return _extract_text(self._lm(messages=messages))
+            return self._call("_lm", self.model, messages)
         except BudgetExceeded:
             raise
         except Exception as e:
@@ -127,10 +150,8 @@ class LLMClient:
                 raise
             logger.warning("%s model %s failed (%s); falling back to %s",
                            self.role, self.model, e, self.fallback_role)
-            if self._fallback_lm is None:
-                self._fallback_lm = self._make(_resolve_role_model(self.fallback_role))
             self.budget.spend(self.fallback_role)
-            return _extract_text(self._fallback_lm(messages=messages))
+            return self._call("_fallback_lm", _resolve_role_model(self.fallback_role), messages)
 
     __call__ = chat
 
