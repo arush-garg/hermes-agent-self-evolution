@@ -169,3 +169,23 @@ def test_every_real_hermes_tool_description_can_be_patched():
         ast.parse(content)
         patched.update(_descs(content, HERMES_REPO / rel))
     assert patched == {t.name: "EVOLVED. " + t.description + " ✓" for t in tools}
+
+
+def test_already_parenthesised_concatenation_gets_no_second_pair(tmp_path):
+    src = ('S = {\n    "name": "a",\n    "description": (\n        "Old one. "\n        "Old two."\n    ),\n}\n'
+           'registry.register(name="a", schema=S)\n')
+    path = _tool_file(tmp_path, src)
+    text = "A rewritten description that is long enough to need wrapping over several lines. " * 2
+    [(_, new)], _ = _apply(tmp_path, path, {"a": text})
+    assert _descs(new, path) == {"a": text}
+    assert "((" not in new.replace(" ", "").replace("\n", "")
+    assert new.startswith('S = {\n    "name": "a",\n    "description": (\n        "A rewritten')
+    assert new.endswith('\n    ),\n}\nregistry.register(name="a", schema=S)\n')
+
+
+def test_bracket_detection_ignores_call_arguments_with_neighbours(tmp_path):
+    src = 'registry.register(name="a", description="Old")\n'
+    path = _tool_file(tmp_path, src)
+    [(_, new)], _ = _apply(tmp_path, path, {"a": "word " * 40})
+    ast.parse(new)
+    assert 'description=(\n' in new  # not alone in the call's brackets, so it gets its own

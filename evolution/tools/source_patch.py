@@ -41,14 +41,22 @@ def _chunks(text: str, width: int) -> list[str]:
     return pieces
 
 
-def python_literal(text: str, indent: int) -> str:
-    """A Python expression evaluating to ``text``: one literal, or a parenthesised
-    implicit concatenation when it is long (parentheses make the newlines legal anywhere)."""
+def python_literal(text: str, indent: int, bracketed: bool = False) -> str:
+    """A Python expression evaluating to ``text``: one literal, or an implicit concatenation
+    when it is long. The concatenation gets its own parentheses (which make the newlines legal)
+    unless ``bracketed`` says the span already sits alone inside a pair of brackets."""
     if len(text) <= WRAP_WIDTH:
         return json.dumps(text, ensure_ascii=False)
+    pieces = [json.dumps(piece, ensure_ascii=False) for piece in _chunks(text, WRAP_WIDTH)]
+    if bracketed:
+        return ("\n" + " " * indent).join(pieces)
     pad = " " * (indent + 4)
-    body = "\n".join(pad + json.dumps(piece, ensure_ascii=False) for piece in _chunks(text, WRAP_WIDTH))
-    return "(\n" + body + "\n" + " " * indent + ")"
+    return "(\n" + "\n".join(pad + piece for piece in pieces) + "\n" + " " * indent + ")"
+
+
+def _is_bracketed(data: bytes, begin: int, end: int) -> bool:
+    """The span is the only thing inside ``( ... )``: e.g. ``"description": ("a" "b")``."""
+    return data[:begin].rstrip()[-1:] == b"(" and data[end:].lstrip()[:1] == b")"
 
 
 def _indent_of(data: bytes, line_starts: list[int], lineno: int) -> int:
@@ -64,7 +72,8 @@ def patch_source(source: str, replacements: dict[Span, str]) -> str:
         lineno, col, end_lineno, end_col = span
         begin = _byte_offset(starts, lineno, col)
         end = _byte_offset(starts, end_lineno, end_col)
-        literal = python_literal(replacements[span], _indent_of(data, starts, lineno))
+        bracketed = _is_bracketed(data, begin, end)
+        literal = python_literal(replacements[span], _indent_of(data, starts, lineno), bracketed)
         data = data[:begin] + literal.encode("utf-8") + data[end:]
     return data.decode("utf-8")
 
