@@ -30,8 +30,63 @@ from evolution.tools.tool_module import (
     format_tools_for_prompt,
     apply_evolved_descriptions,
 )
+from evolution.tools.tool_ratings import feedback_for_tools, flagged_tools, tool_rating_signals
 
 console = Console()
+
+# GEPA budget. ``max_full_evals`` scales with the dataset: 5 evals of a ~290-example set is
+# ~1160 metric calls, which overran the runner's 3 h wall-clock limit (2026-11-04). Cap both
+# the splits and the total metric calls so a run finishes in well under an hour.
+MAX_TRAIN_EXAMPLES = 60
+MAX_VAL_EXAMPLES = 30
+MAX_METRIC_CALLS = 300
+GEPA_THREADS = 4
+
+
+_SELECT_PREFIX = "Select tool:"
+
+
+def _correct_tool(ex: EvalExample) -> str:
+    """The gold tool: the in-memory attribute, else parsed from ``expected_behavior`` (a dataset
+    reloaded with ``--dataset-path`` only round-trips the EvalExample fields)."""
+    tool = ex.__dict__.get("correct_tool", "")
+    if not tool and (ex.expected_behavior or "").startswith(_SELECT_PREFIX):
+        tool = ex.expected_behavior[len(_SELECT_PREFIX):].strip()
+    return tool
+
+
+def _to_dspy_with_tool(examples: list[EvalExample]) -> list[dspy.Example]:
+    return [dspy.Example(task_input=ex.task_input, expected_behavior=ex.expected_behavior,
+                         correct_tool=_correct_tool(ex)).with_inputs("task_input")
+            for ex in examples]
+
+
+def _gepa_budget(iterations: int, n_train: int, n_val: int) -> int:
+    """Metric-call budget: ``iterations`` full passes, never more than ``MAX_METRIC_CALLS``."""
+    return max(1, min(iterations * (n_train + n_val), MAX_METRIC_CALLS))
+
+
+def _bounded_splits(trainset: list, valset: list, flagged: set[str]) -> tuple[list, list]:
+    """Cap train/val; tools the user's low ratings point at are kept in val first."""
+    def prioritized(examples):
+        return sorted(examples, key=lambda e: getattr(e, "correct_tool", "") not in flagged)
+    return prioritized(trainset)[:MAX_TRAIN_EXAMPLES], prioritized(valset)[:MAX_VAL_EXAMPLES]
+
+
+def make_gepa_metric(signals: dict):
+    """GEPA metric with textual feedback: the reflection LM sees what was expected and, for the
+    tools involved, what the user said about them via /rate."""
+    def metric(gold, pred, trace=None, pred_name=None, pred_trace=None):
+        score = tool_selection_metric(gold, pred)
+        expected = getattr(gold, "correct_tool", "") or ""
+        selected = (getattr(pred, "selected_tool", "") or "").strip()
+        feedback = ("Correct tool." if score == 1.0 else
+                    f"Expected {expected}, but selected {selected or 'nothing'}.")
+        user = feedback_for_tools(signals, [t for t in dict.fromkeys([expected, selected]) if t])
+        if user != "none":
+            feedback += "\nUser feedback from rated sessions using these tools:\n" + user
+        return dspy.Prediction(score=score, feedback=feedback)
+    return metric
 
 
 def _parse_cases(raw: str) -> list[dict]:
@@ -50,6 +105,7 @@ def _parse_cases(raw: str) -> list[dict]:
 def _build_tool_selection_dataset(
     tools: list[ToolDescription],
     config: EvolutionConfig,
+    signals: Optional[dict] = None,
 ) -> EvalDataset:
     """Generate a synthetic tool-selection evaluation dataset.
 
@@ -71,6 +127,10 @@ def _build_tool_selection_dataset(
         )
         num_cases_per_tool: int = dspy.InputField(desc="Number of clear cases per tool")
         num_confusion_cases: int = dspy.InputField(desc="Number of cross-tool confusion cases")
+        user_feedback: str = dspy.InputField(
+            desc="The real user's /rate feedback on sessions that used these tools ('none' if absent). "
+                 "When present, include cases that reproduce the situations the user complained about."
+        )
         cases: str = dspy.OutputField(
             desc='JSON array of cases, each with: task_input (str), correct_tool (str), rationale (str), difficulty (easy/medium/hard)'
         )
@@ -89,10 +149,13 @@ def _build_tool_selection_dataset(
         for i in range(0, len(tools), batch_size):
             tool_batch = tools[i : i + batch_size]
             tools_json = format_tools_for_prompt(tool_batch)
+            feedback = feedback_for_tools(signals or {}, [t.name for t in tool_batch])
             result = generator(
                 tools_json=tools_json,
                 num_cases_per_tool=n_per_tool,
-                num_confusion_cases=n_confusion_per_batch,
+                # Rated-session complaints get extra cross-tool confusion cases.
+                num_confusion_cases=n_confusion_per_batch + (2 if feedback != "none" else 0),
+                user_feedback=feedback,
             )
             batch_raw = _parse_cases(result.cases)
             cases_raw.extend(batch_raw)
@@ -106,7 +169,7 @@ def _build_tool_selection_dataset(
             continue
         examples.append(EvalExample(
             task_input=task,
-            expected_behavior=f"Select tool: {correct}",
+            expected_behavior=f"{_SELECT_PREFIX} {correct}",
             difficulty=difficulty,
             category="tool_selection",
             source="synthetic",
@@ -217,6 +280,16 @@ def evolve(
         console.print(f"  Benchmark gate: {'enabled' if benchmark_gate else 'disabled'}")
         return
 
+    # ── 1b. User /rate signal ────────────────────────────────────────────
+    try:
+        signals = tool_rating_signals()
+    except Exception as e:  # a missing/locked state.db must not block evolution
+        console.print(f"  [yellow]Rating signal unavailable: {e}[/yellow]")
+        signals = {}
+    flagged = flagged_tools(signals)
+    console.print(f"  Ratings: {len(signals)} tools in rated sessions, {len(flagged)} in low-rated ones"
+                  + (f" ({', '.join(sorted(flagged)[:8])})" if flagged else ""))
+
     # ── 2. Build evaluation dataset ──────────────────────────────────────
     console.print(f"\n[bold]Building tool selection dataset[/bold]")
 
@@ -228,7 +301,7 @@ def evolve(
         dataset = EvalDataset.load(Path(dataset_path))
         console.print(f"  Loaded dataset: {len(dataset.all_examples)} examples")
     else:
-        dataset = _build_tool_selection_dataset(tools, config)
+        dataset = _build_tool_selection_dataset(tools, config, signals)
         save_path = Path("datasets") / "tools"
         dataset.save(save_path)
         console.print(f"  Generated {len(dataset.all_examples)} tool selection examples")
@@ -251,20 +324,10 @@ def evolve(
     tools_text = format_tools_for_prompt(tools)
     baseline_module = ToolSelectionModule(tools_text)
 
-    # Convert dataset to DSPy examples with correct_tool attribute
-    def _to_dspy_with_tool(examples: list[EvalExample]) -> list[dspy.Example]:
-        result = []
-        for ex in examples:
-            dspy_ex = dspy.Example(
-                task_input=ex.task_input,
-                expected_behavior=ex.expected_behavior,
-                correct_tool=ex.__dict__.get("correct_tool", ""),
-            ).with_inputs("task_input")
-            result.append(dspy_ex)
-        return result
-
-    trainset = _to_dspy_with_tool(dataset.train)
-    valset = _to_dspy_with_tool(dataset.val)
+    trainset, valset = _bounded_splits(_to_dspy_with_tool(dataset.train), _to_dspy_with_tool(dataset.val),
+                                       flagged)
+    budget = _gepa_budget(iterations, len(trainset), len(valset))
+    console.print(f"  GEPA: {len(trainset)} train / {len(valset)} val, budget {budget} metric calls")
 
     # ── 5. Run GEPA ─────────────────────────────────────────────────────
     console.print(f"\n[bold cyan]Running GEPA optimization ({iterations} iterations)...[/bold cyan]\n")
@@ -273,8 +336,9 @@ def evolve(
     try:
         reflection_lm = get_lm_for_role("optimizer", override=optimizer_model)
         optimizer = dspy.GEPA(
-            metric=tool_selection_metric,
-            max_full_evals=iterations,
+            metric=make_gepa_metric(signals),
+            max_metric_calls=budget,
+            num_threads=GEPA_THREADS,
             reflection_lm=reflection_lm,
         )
         optimized_module = optimizer.compile(baseline_module, trainset=trainset, valset=valset)
@@ -332,7 +396,9 @@ def evolve(
     # ── 8. Stage (default) ───────────────────────────────────────────────
     stats = gate.to_dict() | {"baseline_score": avg_baseline, "evolved_score": avg_evolved,
                               "accuracy_improvement": improvement, "tools_evolved": len(tools),
-                              "elapsed_seconds": elapsed, "iterations": iterations}
+                              "elapsed_seconds": elapsed, "iterations": iterations,
+                              "metric_call_budget": budget, "rated_tools": len(signals),
+                              "low_rated_tools": sorted(flagged)}
     staged_paths = []
     try:
         evolved_raw = json.loads(optimized_module.tools_text)
