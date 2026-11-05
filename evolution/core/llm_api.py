@@ -181,7 +181,7 @@ def _enable_omniroute_proxy() -> None:
     _OMNIROUTE_CONFIGURED = True
 
 
-_DEFAULT_MAX_TOKENS = 16384
+_DEFAULT_MAX_TOKENS = 4096
 
 
 @functools.lru_cache(maxsize=64)
