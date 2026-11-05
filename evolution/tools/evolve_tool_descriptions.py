@@ -9,6 +9,7 @@ Usage:
 import json
 import sys
 import time
+from dataclasses import replace
 from pathlib import Path
 from datetime import datetime
 from typing import Optional
@@ -28,8 +29,10 @@ from evolution.tools.tool_module import (
     load_tool_descriptions,
     tool_selection_metric,
     format_tools_for_prompt,
-    apply_evolved_descriptions,
+    _extract_from_source,
 )
+from evolution.tools.evolved_tools import changed_names, evolved_tools_from_instructions
+from evolution.tools.source_patch import apply_to_sources
 from evolution.tools.tool_ratings import feedback_for_tools, flagged_tools, tool_rating_signals
 
 console = Console()
@@ -87,6 +90,30 @@ def make_gepa_metric(signals: dict):
             feedback += "\nUser feedback from rated sessions using these tools:\n" + user
         return dspy.Prediction(score=score, feedback=feedback)
     return metric
+
+
+def _holdout_scores(module, holdout: list, lm) -> list[float]:
+    with dspy.context(lm=lm):
+        return [tool_selection_metric(ex, module(task_input=ex.task_input)) for ex in holdout]
+
+
+def _description_validator(validator: ConstraintValidator):
+    """``is_valid(new, original)``: the evolved description passes the tool constraints."""
+    def is_valid(new: str, original: str) -> bool:
+        return all(r.passed for r in validator.validate_all(new, "tool_description", baseline_text=original))
+    return is_valid
+
+
+def _only_applicable(tools, changes, hermes_repo: Path) -> list[ToolDescription]:
+    """Baseline tools carrying the descriptions read back from the patched sources, so the
+    holdout scores exactly what would ship. Anything not patched (registry-only tools with no
+    source location, skipped conflicts, failed verification) keeps its baseline description."""
+    shipped = {}
+    for rel, content in changes:
+        path = hermes_repo / rel
+        shipped.update({(path.resolve(), t.name): t.description for t in _extract_from_source(content, path)})
+    return [replace(t, description=shipped.get((t.source_file.resolve(), t.name), t.description))
+            if t.source_file else t for t in tools]
 
 
 def _parse_cases(raw: str) -> list[dict]:
@@ -247,7 +274,7 @@ def evolve(
     ----------
     apply: bool
         When True, write any improved tool descriptions back to the hermes-agent
-        source files using ``apply_evolved_descriptions``.
+        source files (AST-span patch, see ``evolution.tools.source_patch``).
     """
 
     config = EvolutionConfig(
@@ -333,8 +360,8 @@ def evolve(
     console.print(f"\n[bold cyan]Running GEPA optimization ({iterations} iterations)...[/bold cyan]\n")
     start_time = time.time()
 
+    reflection_lm = get_lm_for_role("optimizer", override=optimizer_model)
     try:
-        reflection_lm = get_lm_for_role("optimizer", override=optimizer_model)
         optimizer = dspy.GEPA(
             metric=make_gepa_metric(signals),
             max_metric_calls=budget,
@@ -350,18 +377,25 @@ def evolve(
     elapsed = time.time() - start_time
     console.print(f"\n  Optimization completed in {elapsed:.1f}s")
 
-    # ── 6. Evaluate on holdout ───────────────────────────────────────────
+    # ── 6. Extract the evolved descriptions, then evaluate *those* on holdout ──
+    # GEPA's output is selector instructions (often prose, not the tools JSON). Score the
+    # per-tool descriptions recovered from it, because they are what would be applied.
+    with dspy.context(lm=reflection_lm):
+        evolved_tools, how = evolved_tools_from_instructions(
+            tools, optimized_module.tools_text, _description_validator(validator))
+    changes, patch_notes = (apply_to_sources(tools, evolved_tools, config.hermes_agent_path)
+                            if changed_names(tools, evolved_tools) else ([], []))
+    for note in patch_notes:
+        console.print(f"  [yellow]{note}[/yellow]")
+    evolved_tools = _only_applicable(tools, changes, config.hermes_agent_path)
+    changed = changed_names(tools, evolved_tools)
+    console.print(f"  Evolved descriptions ({how}): {len(changed)} tools changed and patchable"
+                  + (f" ({', '.join(changed[:8])}{'...' if len(changed) > 8 else ''})" if changed else ""))
+
     holdout = _to_dspy_with_tool(dataset.holdout)
-    baseline_scores = []
-    evolved_scores = []
-
-    with dspy.context(lm=lm):
-        for ex in holdout:
-            b_pred = baseline_module(task_input=ex.task_input)
-            baseline_scores.append(tool_selection_metric(ex, b_pred))
-
-            e_pred = optimized_module(task_input=ex.task_input)
-            evolved_scores.append(tool_selection_metric(ex, e_pred))
+    baseline_scores = _holdout_scores(baseline_module, holdout, lm)
+    evolved_scores = (_holdout_scores(ToolSelectionModule(format_tools_for_prompt(evolved_tools)), holdout, lm)
+                      if changed else list(baseline_scores))
 
     avg_baseline = sum(baseline_scores) / max(1, len(baseline_scores))
     avg_evolved = sum(evolved_scores) / max(1, len(evolved_scores))
@@ -398,16 +432,10 @@ def evolve(
                               "accuracy_improvement": improvement, "tools_evolved": len(tools),
                               "elapsed_seconds": elapsed, "iterations": iterations,
                               "metric_call_budget": budget, "rated_tools": len(signals),
-                              "low_rated_tools": sorted(flagged)}
+                              "low_rated_tools": sorted(flagged), "description_source": how,
+                              "tools_changed": changed}
     staged_paths = []
-    try:
-        evolved_raw = json.loads(optimized_module.tools_text)
-    except (json.JSONDecodeError, TypeError) as e:
-        console.print(f"[red]Failed to parse evolved tool descriptions: {e}[/red]")
-        evolved_raw = []
-    evolved_tools = [ToolDescription(name=td.get("name", ""), description=td.get("description", ""),
-                                     parameters=td.get("parameters", {})) for td in evolved_raw]
-    changes = apply_evolved_descriptions(tools, evolved_tools, config.hermes_agent_path) if evolved_tools else []
+    evolved_raw = json.loads(format_tools_for_prompt([t for t in evolved_tools if t.name in changed]))
     # Each changed source file is staged as its own artifact (own backup/rollback).
     for rel_path, new_content in changes or []:
         abs_path = config.hermes_agent_path / rel_path
