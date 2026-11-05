@@ -120,6 +120,9 @@ def _extract_constant(source: str, section_name: str, source_path: Path) -> str:
             if isinstance(value, ast.JoinedStr):
                 # For f-strings, fall back to extracting raw text from source
                 return _extract_via_regex(source, section_name)
+            # Handle function calls (e.g., MEMORY_GUIDANCE = build_memory_guidance(True, True))
+            if isinstance(value, ast.Call):
+                return _extract_via_function_call(source, section_name, value, source_path)
 
     raise KeyError(
         f"Section '{section_name}' not found in prompt_builder.py. "
@@ -140,6 +143,94 @@ def _extract_via_regex(source: str, section_name: str) -> str:
         # Return whichever group matched
         return next(g for g in match.groups() if g is not None)
     raise KeyError(f"Cannot extract '{section_name}' via regex fallback")
+
+
+def _extract_via_function_call(
+    source: str, section_name: str, call_node: ast.Call, source_path: Path
+) -> str:
+    """Extract the return value of a function call assignment.
+
+    Handles cases like ``MEMORY_GUIDANCE = build_memory_guidance(True, True)``
+    by extracting the function's source via AST and executing it in isolation,
+    avoiding the full module's import chain.
+    """
+    if not isinstance(call_node.func, ast.Name):
+        raise KeyError(
+            f"Section '{section_name}' is assigned via a non-simple function call "
+            f"({ast.dump(call_node.func)}) — cannot extract automatically."
+        )
+    func_name = call_node.func.id
+
+    # Parse the source and find the function definition
+    try:
+        tree = ast.parse(source)
+    except SyntaxError as e:
+        raise KeyError(f"Cannot parse {source_path}: {e}") from e
+
+    func_def = None
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef) and node.name == func_name:
+            func_def = node
+            break
+    if func_def is None:
+        raise KeyError(
+            f"Function '{func_name}' not found in {source_path} for section '{section_name}'"
+        )
+
+    # Extract the function's source code and exec it in a clean namespace
+    func_source = ast.get_source_segment(source, func_def)
+    if func_source is None:
+        raise KeyError(
+            f"Could not extract source for '{func_name}' from {source_path}"
+        )
+
+    namespace: dict = {}
+    try:
+        exec(compile(func_source, str(source_path), "exec"), namespace)
+    except Exception as e:
+        raise KeyError(
+            f"Failed to compile '{func_name}' from {source_path}: {e}"
+        ) from e
+
+    func = namespace.get(func_name)
+    if func is None:
+        raise KeyError(
+            f"Function '{func_name}' not found after compiling from {source_path}"
+        )
+
+    # Bind default arguments for parameters not provided in the call
+    provided_param_names = {kw.arg for kw in call_node.keywords}
+    import inspect
+
+    sig = inspect.signature(func)
+    kwargs = {}
+    for param_name, param in sig.parameters.items():
+        if param_name in provided_param_names:
+            continue
+        if param.default is not inspect.Parameter.empty:
+            kwargs[param_name] = param.default
+        elif param.kind in (
+            inspect.Parameter.VAR_POSITIONAL,
+            inspect.Parameter.VAR_KEYWORD,
+        ):
+            continue
+
+    try:
+        result = func(**kwargs)
+    except TypeError:
+        try:
+            result = func()
+        except Exception as e:
+            raise KeyError(
+                f"Failed to call '{func_name}()' for section '{section_name}': {e}"
+            ) from e
+
+    if not isinstance(result, str):
+        raise KeyError(
+            f"Function '{func_name}()' returned {type(result).__name__}, not a string — "
+            f"cannot evolve section '{section_name}'"
+        )
+    return result
 
 
 def _replace_constant(
