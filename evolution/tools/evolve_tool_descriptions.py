@@ -34,6 +34,19 @@ from evolution.tools.tool_module import (
 console = Console()
 
 
+def _parse_cases(raw: str) -> list[dict]:
+    """Parse the LLM's case JSON, tolerating markdown fences and truncation."""
+    import re, json
+    text = raw.strip()
+    match = re.search(r'```json\s*(\[.*?\])\s*```', text, re.DOTALL)
+    if match:
+        text = match.group(1)
+    else:
+        match = re.search(r'\[.*\]', text, re.DOTALL)
+        if match:
+            text = match.group(0)
+    return json.loads(text)
+
 def _build_tool_selection_dataset(
     tools: list[ToolDescription],
     config: EvolutionConfig,
@@ -65,25 +78,24 @@ def _build_tool_selection_dataset(
     lm = get_lm_for_role("judge", override=config.judge_model)
     generator = dspy.ChainOfThought(GenerateToolSelectionCases)
 
-    tools_json = format_tools_for_prompt(tools)
-    n_per_tool = max(3, 15 // max(1, len(tools)))
+    n_per_tool = max(5, 30 // max(1, len(tools)))
+    n_confusion_per_batch = max(1, 20 // max(1, len(tools)))
+    batch_size = 5  # tools per LLM call — keeps response within token limits
 
+    cases_raw = []
+    # Generate per-batch so each LLM response stays well under the token limit
+    # (one huge call for all 56 tools overflows ~4096 tokens).
     with dspy.context(lm=lm):
-        result = generator(
-            tools_json=tools_json,
-            num_cases_per_tool=n_per_tool,
-            num_confusion_cases=10,
-        )
-
-    try:
-        cases_raw = json.loads(result.cases)
-    except json.JSONDecodeError:
-        import re
-        match = re.search(r'\[.*\]', result.cases, re.DOTALL)
-        if match:
-            cases_raw = json.loads(match.group())
-        else:
-            raise ValueError(f"Could not parse tool selection cases: {result.cases[:200]}")
+        for i in range(0, len(tools), batch_size):
+            tool_batch = tools[i : i + batch_size]
+            tools_json = format_tools_for_prompt(tool_batch)
+            result = generator(
+                tools_json=tools_json,
+                num_cases_per_tool=n_per_tool,
+                num_confusion_cases=n_confusion_per_batch,
+            )
+            batch_raw = _parse_cases(result.cases)
+            cases_raw.extend(batch_raw)
 
     examples = []
     for c in cases_raw:

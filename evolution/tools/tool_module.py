@@ -31,19 +31,33 @@ def load_tool_descriptions(hermes_repo: Path) -> list[ToolDescription]:
     """Load tool descriptions from the hermes-agent repo.
 
     Strategy:
-    1. Try importing the tool registry directly (most accurate)
-    2. Fall back to regex parsing of tools/*.py files
+    1. Regex scan of tools/*.py — covers every file and carries source_file,
+       which is required to apply evolved descriptions back to source.
+    2. Tool registry import as a supplement (covers tools registered but not
+       matching the regex patterns). Dedupe by name, preferring regex entries.
 
     Args:
         hermes_repo: Path to the hermes-agent repository root.
 
     Returns:
-        List of ToolDescription objects, one per registered tool.
+        List of ToolDescription objects, one per tool.
     """
+    descriptions: list[ToolDescription] = []
+    # Regex scan first: it finds every tools/*.py file and sets source_file.
     try:
-        return _load_via_registry(hermes_repo)
+        descriptions = _load_via_regex(hermes_repo)
     except Exception:
-        return _load_via_regex(hermes_repo)
+        pass
+    # Registry as a supplement; dedupe by name, keep regex entries (source_file).
+    try:
+        reg = _load_via_registry(hermes_repo)
+        by_name = {d.name: d for d in descriptions}
+        for d in reg:
+            if d.name not in by_name:
+                descriptions.append(d)
+    except Exception:
+        pass
+    return descriptions
 
 
 def _load_via_registry(hermes_repo: Path) -> list[ToolDescription]:
@@ -54,16 +68,27 @@ def _load_via_registry(hermes_repo: Path) -> list[ToolDescription]:
     try:
         import importlib
         registry_mod = importlib.import_module("tools.registry")
-        tools = registry_mod.get_all_tools()
+
+        # First, discover and import all built-in tool modules so they call
+        # registry.register() and populate the singleton registry.
+        try:
+            registry_mod.discover_builtin_tools(hermes_repo / "tools")
+        except Exception:
+            # Individual module import failures are logged by discover_builtin_tools;
+            # proceed with whatever entries are already registered.
+            pass
+
+        reg = registry_mod.registry
+        entries = reg.get_all_entries()
 
         descriptions = []
-        for tool in tools:
-            schema = tool.get("schema", {}) if isinstance(tool, dict) else {}
-            name = schema.get("name", "") or tool.get("name", "")
+        for entry in entries:
+            name = entry.name
             if not name:
                 continue
 
-            desc = schema.get("description", "")
+            schema = entry.schema if isinstance(entry.schema, dict) else {}
+            desc = entry.description or schema.get("description", "")
             params = {}
             for param_name, param_info in schema.get("parameters", {}).get("properties", {}).items():
                 params[param_name] = param_info.get("description", "")
@@ -107,41 +132,111 @@ def _load_via_regex(hermes_repo: Path) -> list[ToolDescription]:
     return descriptions
 
 
+def _eval_str(node: ast.AST, constants: dict[str, ast.AST]) -> Optional[str]:
+    """Best-effort static evaluation of an AST node to a string.
+
+    Handles string literals, name references to module-level string constants,
+    and adjacent/concatenated string literals. Returns None for anything that
+    can't be resolved without executing code (f-strings, function calls, etc.).
+    """
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return node.value
+    if isinstance(node, ast.Name):
+        const = constants.get(node.id)
+        if const is not None:
+            return _eval_str(const, constants)
+    # Adjacent string literals ("a" "b") are folded by the parser into one Constant.
+    # Explicit concatenation ("a" + "b") — best effort: resolve each side.
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+        left = _eval_str(node.left, constants)
+        right = _eval_str(node.right, constants)
+        if left is not None and right is not None:
+            return left + right
+    return None
+
+
+def _desc_from_dict_node(dict_node: ast.Dict) -> Optional[str]:
+    """Pull the ``"description": "..."`` entry out of a schema dict literal."""
+    for k, v in zip(dict_node.keys, dict_node.values):
+        if isinstance(k, ast.Constant) and k.value == "description":
+            return _eval_str(v, {})
+    return None
+
+
+def _description_from_schema(schema_node: ast.AST, constants: dict[str, ast.AST]) -> Optional[str]:
+    """Resolve a schema argument to a description string.
+
+    Supports an inline dict literal or a name reference to a module-level
+    schema constant. Function-call schemas (e.g. build_xxx_schema()) can't be
+    resolved statically and return None.
+    """
+    if isinstance(schema_node, ast.Dict):
+        return _desc_from_dict_node(schema_node)
+    if isinstance(schema_node, ast.Name):
+        const = constants.get(schema_node.id)
+        if const is not None and isinstance(const, ast.Dict):
+            return _desc_from_dict_node(const)
+    return None
+
+
 def _extract_from_source(source: str, source_file: Path) -> list[ToolDescription]:
-    """Extract tool registrations from a single Python source file."""
+    """Extract tool registrations from a single Python source file.
+
+    Walks the AST looking for ``registry.register(...)`` calls and pulls the
+    tool ``name`` plus its ``description``. The description may come from:
+
+    * a ``description="..."`` keyword on the register call itself, or
+    * the ``"description": "..."`` entry of a schema dict passed via
+      ``schema=_CONSTANT`` (module-level constant) or an inline dict.
+
+    Schemas built by function calls (``build_xxx_schema()``) can't be resolved
+    statically and are skipped.
+    """
     results = []
+    try:
+        tree = ast.parse(source, filename=str(source_file))
+    except SyntaxError:
+        return results
 
-    # Look for registry.register(...) calls
-    # Pattern: registry.register(name="...", description="...", parameters={...})
-    register_pattern = re.compile(
-        r'registry\.register\s*\(',
-        re.MULTILINE,
-    )
+    # Collect module-level constant assignments (name -> AST value).
+    constants: dict[str, ast.AST] = {}
+    for stmt in tree.body:
+        if isinstance(stmt, ast.Assign):
+            for target in stmt.targets:
+                if isinstance(target, ast.Name):
+                    constants[target.id] = stmt.value
+        elif isinstance(stmt, ast.AnnAssign) and isinstance(stmt.target, ast.Name):
+            if stmt.value is not None:
+                constants[stmt.target.id] = stmt.value
 
-    for match in register_pattern.finditer(source):
-        start = match.start()
-        # Find the matching closing paren
-        depth = 0
-        end = start
-        for i in range(start, len(source)):
-            if source[i] == '(':
-                depth += 1
-            elif source[i] == ')':
-                depth -= 1
-                if depth == 0:
-                    end = i + 1
-                    break
+    for node in ast.walk(tree):
+        if not (
+            isinstance(node, ast.Expr)
+            and isinstance(node.value, ast.Call)
+            and isinstance(node.value.func, ast.Attribute)
+            and node.value.func.attr == "register"
+            and isinstance(node.value.func.value, ast.Name)
+            and node.value.func.value.id == "registry"
+        ):
+            continue
 
-        call_text = source[start:end]
+        call = node.value
+        name: Optional[str] = None
+        description: Optional[str] = None
+        for kw in call.keywords:
+            if kw.arg == "name":
+                name = _eval_str(kw.value, constants)
+            elif kw.arg == "description":
+                description = _eval_str(kw.value, constants)
+            elif kw.arg == "schema":
+                description = description or _description_from_schema(
+                    kw.value, constants
+                )
 
-        # Extract name and description using simple regex
-        name_match = re.search(r'name\s*=\s*["\']([^"\']+)["\']', call_text)
-        desc_match = re.search(r'description\s*=\s*["\']([^"\']*)["\']', call_text)
-
-        if name_match and desc_match:
+        if name and description:
             results.append(ToolDescription(
-                name=name_match.group(1),
-                description=desc_match.group(1),
+                name=name,
+                description=description,
                 parameters={},
                 source_file=source_file,
             ))
@@ -174,12 +269,19 @@ def apply_evolved_descriptions(
             continue
 
         source = orig.source_file.read_text()
-        # Replace the specific description string for this tool
-        new_source = source.replace(
-            f'description="{orig.description}"',
-            f'description="{evolved.description}"',
-            1,
-        )
+        # Replace the specific description string for this tool. Try both the
+        # JSON-style ``"description": "..."`` key used inside schema dicts and
+        # the Python-style ``description="..."`` kwarg on register() calls.
+        replacements = [
+            (f'"description": "{orig.description}"', f'"description": "{evolved.description}"'),
+            (f"description='{orig.description}'", f"description='{evolved.description}'"),
+            (f'description="{orig.description}"', f'description="{evolved.description}"'),
+        ]
+        new_source = source
+        for old, new in replacements:
+            if old in source:
+                new_source = source.replace(old, new, 1)
+                break
         if new_source != source:
             changes[orig.source_file] = new_source
 
