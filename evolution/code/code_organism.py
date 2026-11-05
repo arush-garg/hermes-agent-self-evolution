@@ -25,7 +25,7 @@ class CodeTarget:
     """Describes a code evolution target."""
     source_file: Path               # Relative to hermes-agent repo root
     target_functions: list[str] = field(default_factory=list)  # Functions to evolve (empty = all)
-    test_command: str = "python -m pytest tests/ -q --tb=short --ignore=tests/integration --ignore=tests/e2e --ignore=tests/stress --ignore=tests/manual --ignore=tests/gateway --ignore=tests/ci -n=0"
+    test_command: str = f"{sys.executable} -m pytest tests/ -q --tb=short --ignore=tests/integration --ignore=tests/e2e --ignore=tests/stress --ignore=tests/manual --ignore=tests/gateway --ignore=tests/ci -n=0"
     bug_description: str = ""       # What bug/edge case we're targeting
 
 

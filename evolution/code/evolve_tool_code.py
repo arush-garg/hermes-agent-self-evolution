@@ -114,7 +114,7 @@ def evolve(
 
     target = CodeTarget(
         source_file=rel_path,
-        test_command="python -m pytest tests/ -q --tb=short --ignore=tests/integration --ignore=tests/e2e --ignore=tests/stress --ignore=tests/manual --ignore=tests/gateway --ignore=tests/ci -n=0",
+        test_command=f"{sys.executable} -m pytest tests/ -q --tb=short --ignore=tests/integration --ignore=tests/e2e --ignore=tests/stress --ignore=tests/manual --ignore=tests/gateway --ignore=tests/ci -n=0",
         bug_description=bug_description,
     )
 
