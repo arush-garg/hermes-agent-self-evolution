@@ -38,3 +38,6 @@ logs/
 
 # Staged evolution candidates, manifests, backups (evolution.core.staging)
 staging/
+
+# Ad-hoc evolution run output
+evolution_run.log
