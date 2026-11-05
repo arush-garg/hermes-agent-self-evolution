@@ -25,6 +25,9 @@ class ToolDescription:
     description: str                    # Top-level tool description text
     parameters: dict[str, str]          # param_name -> description text
     source_file: Optional[Path] = None  # tools/*.py it came from
+    # Source span (lineno, col, end_lineno, end_col; UTF-8 byte cols) of the string expression
+    # the description was read from, so it can be rewritten in place. None if not from source.
+    description_span: Optional[tuple[int, int, int, int]] = None
 
 
 def load_tool_descriptions(hermes_repo: Path) -> list[ToolDescription]:
@@ -155,11 +158,33 @@ def _eval_str(node: ast.AST, constants: dict[str, ast.AST]) -> Optional[str]:
     return None
 
 
-def _desc_from_dict_node(dict_node: ast.Dict) -> Optional[str]:
-    """Pull the ``"description": "..."`` entry out of a schema dict literal."""
+def _string_node(node: ast.AST, constants: dict[str, ast.AST]) -> Optional[ast.AST]:
+    """The expression node that holds the string text: follows a name to its module constant."""
+    if isinstance(node, ast.Name) and isinstance(constants.get(node.id), ast.AST):
+        return _string_node(constants[node.id], constants)
+    return node
+
+
+def _desc_value_from_dict_node(dict_node: ast.Dict) -> Optional[ast.AST]:
+    """The value node of the ``"description": ...`` entry of a schema dict literal."""
     for k, v in zip(dict_node.keys, dict_node.values):
         if isinstance(k, ast.Constant) and k.value == "description":
-            return _eval_str(v, {})
+            return v
+    return None
+
+
+def _desc_from_dict_node(dict_node: ast.Dict) -> Optional[str]:
+    """Pull the ``"description": "..."`` entry out of a schema dict literal."""
+    value = _desc_value_from_dict_node(dict_node)
+    return _eval_str(value, {}) if value is not None else None
+
+
+def _schema_desc_node(schema_node: ast.AST, constants: dict[str, ast.AST]) -> Optional[ast.AST]:
+    """Description value node of an inline schema dict or a named module-level schema dict."""
+    if isinstance(schema_node, ast.Name):
+        schema_node = constants.get(schema_node.id)
+    if isinstance(schema_node, ast.Dict):
+        return _desc_value_from_dict_node(schema_node)
     return None
 
 
@@ -170,13 +195,14 @@ def _description_from_schema(schema_node: ast.AST, constants: dict[str, ast.AST]
     schema constant. Function-call schemas (e.g. build_xxx_schema()) can't be
     resolved statically and return None.
     """
-    if isinstance(schema_node, ast.Dict):
-        return _desc_from_dict_node(schema_node)
-    if isinstance(schema_node, ast.Name):
-        const = constants.get(schema_node.id)
-        if const is not None and isinstance(const, ast.Dict):
-            return _desc_from_dict_node(const)
-    return None
+    value = _schema_desc_node(schema_node, constants)
+    return _eval_str(value, {}) if value is not None else None
+
+
+def _span(node: Optional[ast.AST]) -> Optional[tuple[int, int, int, int]]:
+    if node is None or getattr(node, "end_lineno", None) is None:
+        return None
+    return node.lineno, node.col_offset, node.end_lineno, node.end_col_offset
 
 
 def _extract_from_source(source: str, source_file: Path) -> list[ToolDescription]:
@@ -223,15 +249,16 @@ def _extract_from_source(source: str, source_file: Path) -> list[ToolDescription
         call = node.value
         name: Optional[str] = None
         description: Optional[str] = None
+        desc_node: Optional[ast.AST] = None
         for kw in call.keywords:
             if kw.arg == "name":
                 name = _eval_str(kw.value, constants)
             elif kw.arg == "description":
                 description = _eval_str(kw.value, constants)
-            elif kw.arg == "schema":
-                description = description or _description_from_schema(
-                    kw.value, constants
-                )
+                desc_node = _string_node(kw.value, constants)
+            elif kw.arg == "schema" and not description:
+                description = _description_from_schema(kw.value, constants)
+                desc_node = _schema_desc_node(kw.value, constants)
 
         if name and description:
             results.append(ToolDescription(
@@ -239,6 +266,7 @@ def _extract_from_source(source: str, source_file: Path) -> list[ToolDescription
                 description=description,
                 parameters={},
                 source_file=source_file,
+                description_span=_span(desc_node),
             ))
 
     return results
@@ -252,49 +280,16 @@ def apply_evolved_descriptions(
     """Apply evolved descriptions back to source files.
 
     Only modifies description text — never touches parameter names,
-    types, required fields, or any other schema structure.
+    types, required fields, or any other schema structure. Each description is
+    rewritten at its recorded AST span and the result is re-parsed and verified
+    (see ``evolution.tools.source_patch``).
 
     Returns:
         List of (relative_path, new_content) tuples for pr_builder.
     """
-    # Build lookup: name -> evolved description
-    evolved_map = {t.name: t for t in evolved_tools}
-    changes: dict[Path, str] = {}
-
-    for orig in original_tools:
-        evolved = evolved_map.get(orig.name)
-        if not evolved or evolved.description == orig.description:
-            continue
-        if not orig.source_file or not orig.source_file.exists():
-            continue
-
-        source = orig.source_file.read_text()
-        # Replace the specific description string for this tool. Try both the
-        # JSON-style ``"description": "..."`` key used inside schema dicts and
-        # the Python-style ``description="..."`` kwarg on register() calls.
-        replacements = [
-            (f'"description": "{orig.description}"', f'"description": "{evolved.description}"'),
-            (f"description='{orig.description}'", f"description='{evolved.description}'"),
-            (f'description="{orig.description}"', f'description="{evolved.description}"'),
-        ]
-        new_source = source
-        for old, new in replacements:
-            if old in source:
-                new_source = source.replace(old, new, 1)
-                break
-        if new_source != source:
-            changes[orig.source_file] = new_source
-
-    # Return as (relative_path, content) tuples
-    result = []
-    for abs_path, content in changes.items():
-        try:
-            rel = abs_path.relative_to(hermes_repo)
-        except ValueError:
-            rel = abs_path
-        result.append((rel, content))
-
-    return result
+    from evolution.tools.source_patch import apply_to_sources
+    changes, _notes = apply_to_sources(original_tools, evolved_tools, hermes_repo)
+    return changes
 
 
 class ToolSelectionModule(dspy.Module):
