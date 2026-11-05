@@ -532,7 +532,10 @@ def _main(args, protect=()) -> None:
         row = next((r for r in mine(days=30) if r['artifact'] == artifact), None)
         if row:
             print(f"[dry-run] Failure evidence for {artifact}: score={row['score']} "
-                  f"failure_sessions={row['failure_sessions']} correction_sessions={row['correction_sessions']}")
+                  f"failure_sessions={row['failure_sessions']} correction_sessions={row['correction_sessions']} "
+                  f"low_rated={row.get('low_rated_sessions', 0)} high_rated={row.get('high_rated_sessions', 0)}")
+            for fb in row.get('user_feedback', [])[:3]:
+                print(f"    /rate {fb['rating']}/5: {fb['comment'][:120]}")
             for f in row['failures'][:3]:
                 print(f"    {f['tool']} x{f['sessions']}: {f['error_signature'][:120]}")
         else:

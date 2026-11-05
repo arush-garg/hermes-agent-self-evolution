@@ -6,9 +6,13 @@ Signals (per artifact = skill loaded via skill_view *before* the signal in the s
     (see ``trajectory_replay.tool_failure``). ``exit_code: 0`` output that merely contains
     the word "ERROR" is not a failure.
   * user corrections: the next user turn opens with a correction cue (``is_correction``).
+  * user ratings: the user's explicit ``/rate <1-5> [feedback]`` for the session
+    (``ratings.jsonl`` beside state.db, see ``user_ratings``). A low rating (<=2) counts against
+    every skill loaded in that session; any rating's feedback text rides along so the optimizer
+    sees what to fix and what to preserve.
 
 Ranking counts distinct sessions, not raw messages, so one noisy session cannot inflate
-the score: score = 3*correction_sessions + failure_sessions + recurring-signature bonus.
+the score: score = 4*low_rated_sessions + 3*correction_sessions + failure_sessions + recurring bonus.
 Context is short ``error_signature`` strings (<=200 chars, redacted), never raw output,
 and each artifact's serialized context is capped at MAX_CONTEXT_CHARS.
 """
@@ -17,9 +21,13 @@ import json
 import re
 from collections import defaultdict
 
-from evolution.core.trajectory_replay import sessions, _calls, redact, tool_failure, is_correction
+from evolution.core.trajectory_replay import DB_PATH, sessions, _calls, redact, tool_failure, is_correction
+from evolution.core.user_ratings import HIGH_RATING_MIN, LOW_RATING_MAX, load_latest_ratings, ratings_path_for_db
 
 MAX_CONTEXT_CHARS = 2000
+MAX_FEEDBACK_ITEMS = 5
+MAX_FEEDBACK_CHARS = 300
+LOW_RATING_WEIGHT = 4  # an explicit bad rating outweighs an inferred correction (3)
 _NORM = re.compile(r'0x[0-9a-f]+|\d+|/[^\s:\'"]+')
 
 
@@ -33,18 +41,42 @@ def _skill_name(args):
 
 def _bound(row, limit=MAX_CONTEXT_CHARS):
     """Drop trailing examples until the JSON-serialized row fits in ``limit`` chars."""
-    while len(json.dumps(row)) > limit and (row['failures'] or row['corrections']):
-        (row['failures'] if len(row['failures']) >= len(row['corrections']) else row['corrections']).pop()
+    while len(json.dumps(row)) > limit:
+        lists = [row[k] for k in ('failures', 'corrections', 'user_feedback') if row.get(k)]
+        if not lists:
+            break
+        max(lists, key=len).pop()
     return row
+
+
+def _default_ratings_path(db_path):
+    import os
+    return ratings_path_for_db(db_path or os.getenv('HERMES_STATE_DB', DB_PATH))
+
+
+def _apply_rating(data, sid, skills, rating):
+    """Attach one session's /rate verdict to every skill loaded in that session."""
+    score = rating['rating']
+    comment = redact(str(rating.get('comment') or '').strip())[:MAX_FEEDBACK_CHARS]
+    for skill in skills:
+        entry = data[skill]
+        if score <= LOW_RATING_MAX:
+            entry['low_rated'].add(sid)
+        elif score >= HIGH_RATING_MIN:
+            entry['high_rated'].add(sid)
+        if comment and len(entry['feedback']) < MAX_FEEDBACK_ITEMS:
+            entry['feedback'].append({'rating': score, 'comment': comment})
 
 
 # Harness approval/guard refusals are policy outcomes, not skill defects.
 _POLICY_BLOCK = re.compile(r'(?i)BLOCKED:|flagged as dangerous|\[harness-guard\]|approval (?:denied|required)')
 
 
-def mine(days=30, db_path=None):
+def mine(days=30, db_path=None, ratings_path=None):
     data = defaultdict(lambda: {'fail_sessions': set(), 'corr_sessions': set(),
-                                'sigs': defaultdict(set), 'tools': {}, 'corrections': []})
+                                'sigs': defaultdict(set), 'tools': {}, 'corrections': [],
+                                'low_rated': set(), 'high_rated': set(), 'feedback': []})
+    ratings = load_latest_ratings(ratings_path or _default_ratings_path(db_path))
     for sid, messages in sessions(db_path, days):
         active = []  # skills loaded so far in this session (order preserved)
         for m in messages:
@@ -72,23 +104,29 @@ def mine(days=30, db_path=None):
                     if sid not in entry['corr_sessions'] and len(entry['corrections']) < 5:
                         entry['corrections'].append(redact(str(m['content']).strip())[:200])
                     entry['corr_sessions'].add(sid)
+        if sid in ratings and active:
+            _apply_rating(data, sid, active, ratings[sid])
     result = []
     for artifact, entry in data.items():
         recurring = sorted(((len(s), k) for k, s in entry['sigs'].items()), key=lambda x: (-x[0], x[1]))
         bonus = sum(min(n, 5) for n, _ in recurring if n >= 2)
-        score = 3 * len(entry['corr_sessions']) + len(entry['fail_sessions']) + bonus
+        score = (LOW_RATING_WEIGHT * len(entry['low_rated']) + 3 * len(entry['corr_sessions'])
+                 + len(entry['fail_sessions']) + bonus)
         row = {
             'artifact': artifact,
             'score': score,
-            'session_count': len(entry['fail_sessions'] | entry['corr_sessions']),
+            'session_count': len(entry['fail_sessions'] | entry['corr_sessions'] | entry['low_rated']),
             'failure_sessions': len(entry['fail_sessions']),
             'correction_sessions': len(entry['corr_sessions']),
             'failures': [{'tool': k[0], 'sessions': n, 'error_signature': entry['tools'][k]}
                          for n, k in recurring[:8]],
             'corrections': list(entry['corrections']),
+            'low_rated_sessions': len(entry['low_rated']),
+            'high_rated_sessions': len(entry['high_rated']),
+            'user_feedback': list(entry['feedback']),
         }
         result.append(_bound(row))
-    result.sort(key=lambda r: (-r['score'], -r['correction_sessions'], r['artifact']))
+    result.sort(key=lambda r: (-r['score'], -r['low_rated_sessions'], -r['correction_sessions'], r['artifact']))
     return result
 
 
